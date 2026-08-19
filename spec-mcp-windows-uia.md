@@ -50,7 +50,7 @@ Dentro do Google Chrome o agente já tem uma experiência qualitativamente super
 │  Claude Desktop      │ ─────────────────────────────► │  mcp-windows-uia (Python)  │
 │  (cliente MCP)       │ ◄───────────────────────────── │                            │
 └──────────────────────┘                                │  ┌──────────────────────┐  │
-                                                        │  │ camada MCP (FastMCP) │  │
+                                                        │  │ camada MCP (MCPServer)│  │
                                                         │  ├──────────────────────┤  │
                                                         │  │ policy: allowlist,   │  │
                                                         │  │ read-only, audit     │  │
@@ -77,7 +77,7 @@ mcp-windows-uia/
 ├─ config.toml                  # allowlist, flags, limites
 ├─ src/mcp_windows_uia/
 │  ├─ __main__.py               # entrypoint, CLI args, DPI awareness, mcp.run(stdio)
-│  ├─ server.py                 # definição das tools (FastMCP)
+│  ├─ server.py                 # definição das tools (MCPServer, mcp>=2.0)
 │  ├─ worker.py                 # UiaWorker: thread STA única + CoInitializeEx
 │  ├─ uia/
 │  │  ├─ core.py                # CUIAutomation8/IUIAutomation6, CacheRequest, TreeWalker, condições
@@ -990,7 +990,7 @@ from __future__ import annotations
 import argparse, ctypes, logging, sys
 from typing import Annotated, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer  # mcp>=2.0; na 1.x era mcp.server.fastmcp.FastMCP
 from pydantic import Field
 
 # 1) DPI awareness ANTES de qualquer coisa de UI
@@ -1007,7 +1007,7 @@ def _init_dpi() -> None:
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-mcp = FastMCP("windows-uia")
+mcp = MCPServer("windows-uia")
 
 
 @mcp.tool()

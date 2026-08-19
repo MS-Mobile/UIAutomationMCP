@@ -11,3 +11,5 @@ dist/
 audit/
 *.jsonl
 config.local.toml
+comtypes/
+config.toml

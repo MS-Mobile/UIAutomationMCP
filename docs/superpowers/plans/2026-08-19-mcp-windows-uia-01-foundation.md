@@ -6,7 +6,7 @@
 
 **Architecture:** Servidor MCP stdio em Python. Todas as chamadas COM correm numa única thread STA (`ThreadPoolExecutor(max_workers=1)`); ponteiros COM nunca cruzam threads. O cliente UIA é `CUIAutomation8` obtido via `comtypes.client.CreateObject` com `ConnectionTimeout`/`TransactionTimeout` = 10 s — é isso que impede que um app travado pendure o servidor. A enumeração de janelas usa `EnumWindows` (Win32) em vez da árvore UIA, porque só o Win32 dá `WS_VISIBLE`/`IsIconic`/placement de forma barata e confiável. As camadas puras (erros, config, policy, budget, refs, audit) não tocam COM e são testadas isoladamente.
 
-**Tech Stack:** Python 3.14 x64 (piso 3.11), `mcp` (FastMCP, stdio), `comtypes>=1.4.16` (+ `GetModule("UIAutomationCore.dll")`), `psutil`, `pytest`, `pytest-asyncio`. **Sem `uiautomation`** — ver §3.3 da spec.
+**Tech Stack:** Python 3.14 x64 (piso 3.11), `mcp` 2.x (`MCPServer`, stdio — o `FastMCP` da 1.x foi renomeado; `mcp.server.fastmcp` nao existe mais), `comtypes>=1.4.16` (+ `GetModule("UIAutomationCore.dll")`), `psutil`, `pytest`, `pytest-asyncio`. **Sem `uiautomation`** — ver §3.3 da spec.
 
 **Spec de referência:** `spec-mcp-windows-uia.md`, seções citadas em cada task.
 
@@ -3028,7 +3028,7 @@ git commit -m "feat(uia): enumeracao de janelas com dpi, monitor e elevacao"
 
 ---
 
-### Task 12: `context.py`, `server.py` e `__main__.py` — FastMCP e `uia_list_windows`
+### Task 12: `context.py`, `server.py` e `__main__.py` — MCPServer e `uia_list_windows`
 
 **Files:**
 - Create: `src/mcp_windows_uia/context.py`
@@ -3225,7 +3225,7 @@ import time
 from collections.abc import Callable
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from .context import ServerContext, context
@@ -3234,7 +3234,7 @@ from .uia.windows import enumerate_windows, server_is_elevated
 
 _log = logging.getLogger(__name__)
 
-mcp = FastMCP("windows-uia")
+mcp = MCPServer("windows-uia")
 
 
 def tool_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -3358,7 +3358,7 @@ async def uia_list_windows(
     )
 ```
 
-> **Se o FastMCP não conseguir montar o schema** por causa do `functools.wraps` no
+> **Se o `MCPServer` não conseguir montar o schema** por causa do `functools.wraps` no
 > decorator, inverta a ordem: registre uma função de assinatura explícita e chame o
 > corpo decorado por dentro. Verifique com o Step 7 antes de mexer — na maioria das
 > versões o `inspect.signature` segue o `__wrapped__` e funciona como está.
@@ -3450,7 +3450,7 @@ Expected: encerra silenciosamente (stdin fechado). Qualquer traceback aqui é bu
 ```bash
 git add src/mcp_windows_uia/context.py src/mcp_windows_uia/server.py \
         src/mcp_windows_uia/__main__.py tests/test_server_list_windows.py
-git commit -m "feat(server): FastMCP stdio, contexto do servidor e uia_list_windows"
+git commit -m "feat(server): MCPServer stdio, contexto do servidor e uia_list_windows"
 ```
 
 ---
