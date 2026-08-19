@@ -12,7 +12,7 @@
 | Prefixo das ferramentas | `uia_` |
 | Transporte | stdio (JSON-RPC 2.0) |
 | Plataforma | Windows 10 (1809+) e Windows 11, x64 |
-| Runtime | Python 3.11+ (64-bit) |
+| Runtime | Python 3.14 x64 (piso suportado: 3.11) |
 
 **Convenção de idioma:** este documento é em português. A *superfície de API* (nomes de ferramentas, chaves JSON, códigos e mensagens de erro, descrições das tools expostas via MCP) é em **inglês**, porque é consumida por um LLM e deve seguir a convenção do ecossistema MCP. Não traduza a API.
 
@@ -80,7 +80,7 @@ mcp-windows-uia/
 │  ├─ server.py                 # definição das tools (FastMCP)
 │  ├─ worker.py                 # UiaWorker: thread STA única + CoInitializeEx
 │  ├─ uia/
-│  │  ├─ core.py                # wrapper do IUIAutomation, CacheRequest, TreeWalker
+│  │  ├─ core.py                # CUIAutomation8/IUIAutomation6, CacheRequest, TreeWalker, condições
 │  │  ├─ tree.py                # captura/filtragem/serialização da árvore
 │  │  ├─ patterns.py            # invoke/toggle/select/expand/value/scroll + fallback
 │  │  ├─ windows.py             # enumeração de top-level windows
@@ -118,38 +118,50 @@ UIA_EXECUTOR = ThreadPoolExecutor(
 )
 ```
 
-Se disponível, instanciar `CUIAutomation8` (Windows 8+) em vez de `CUIAutomation`, e configurar `IUIAutomation6.ConnectionTimeout` / `TransactionTimeout` = 10000 ms. Isso evita travamento quando o app-alvo não bombeia mensagens.
+Instanciar **obrigatoriamente** `CUIAutomation8` (Windows 8+) via `comtypes.client.CreateObject(UIA.CUIAutomation8, interface=UIA.IUIAutomation6)` e configurar `ConnectionTimeout` / `TransactionTimeout` = 10000 ms. Isso evita travamento quando o app-alvo não bombeia mensagens, e é o que torna **CA-23** implementável. Verificado funcionando em 2026-08-19 (§3.1); o `CUIAutomation` legado **não** expõe essas propriedades.
 
 ---
 
 ## 3. Escolha de biblioteca Python
 
-### 3.1 Comparativo
+### 3.1 Evidência empírica (medida em 2026-08-19, Windows 11 26200, Python 3.14.6 x64)
 
-| Critério | `uiautomation` (yinkaisheng) | `pywinauto` (backend `uia`) | `comtypes` direto (UIAutomationCore) |
-|---|---|---|---|
-| Modelo | Wrapper fino sobre COM; classes `Control` por ControlType | Framework alto nível (`Application`, `WindowSpecification`, `.child_window()`) | Sem abstração; `IUIAutomation*` cru |
-| Cobertura de patterns | Alta — todos os patterns UIA expostos (`ValuePattern`, `TogglePattern`, `ExpandCollapsePattern`, `ScrollPattern`, `SelectionItemPattern`, `TextPattern`…) | Média — expõe métodos convenientes, mas esconde patterns menos comuns | Total (é a API) |
-| Acesso a `RuntimeId` | Sim (`control.GetRuntimeId()`) | Indireto (`element_info.runtime_id`) | Sim |
-| `CacheRequest` / `FindAllBuildCache` | Não exposto, mas dá para chegar no `IUIAutomationElement` cru via `control.Element` | Não exposto de forma útil | Sim, controle total |
-| Performance em árvores grandes | Média — 1 chamada COM cross-process por propriedade | Baixa — camada extra + `best_match` custoso | Alta com cache (1 chamada para N propriedades de N elementos) |
-| Boilerplate | Baixo | Muito baixo | Alto (enums, `IUIAutomationCondition`, `TreeWalker`, tratamento de `HRESULT`) |
-| Dependências | `comtypes` | `comtypes` + `pywin32` + `six` + `Pillow` | `comtypes` |
-| Manutenção | Mantenedor único, releases esparsos, docs fracas (mas código legível) | Projeto maduro, docs boas, comunidade maior | N/A (é a API do SO, estável desde Win7) |
-| Riscos | Estado global (`uiautomation.SetGlobalSearchTimeout`), `TIME_OUT_SECOND` implícito de busca | Abstrações "mágicas" (`best_match`) produzem seleção não determinística — conflita com o princípio 4 | Erros de tipagem COM difíceis de depurar; sem rede de segurança |
+A decisão abaixo foi tomada contra medição, não contra reputação. Quatro provas de conceito:
 
-### 3.2 Recomendação
+| Verificação | Resultado |
+|---|---|
+| `comtypes.client.GetModule("UIAutomationCore.dll")` | Gera **626 símbolos** em 142 ms: 175 `*PropertyId`, 41 `*ControlTypeId`, 32 `*PatternId`, 32 `Is*PatternAvailablePropertyId`, todas as `TreeScope_*`/`AutomationElementMode_*`, todas as interfaces `IUIAutomation`…`IUIAutomation6` e o coclass `CUIAutomation8` |
+| `uiautomation` → `QueryInterface(IUIAutomation2..6)` | **Falha em todas.** A lib instancia `CUIAutomation` (legado), logo `ConnectionTimeout`/`TransactionTimeout` exigidos pela §2.2 são inalcançáveis pelo cliente dela |
+| `CreateObject(CUIAutomation8, interface=IUIAutomation6)` via comtypes | OK. `ConnectionTimeout = 10000` e `TransactionTimeout = 10000` aceitos e lidos de volta |
+| `FindAllBuildCache` + `CacheRequest` com 11 propriedades | 27 nós com todas as propriedades cacheadas lidas em ~130 ms, zero RPC adicional por propriedade |
 
-**Usar `uiautomation` como camada base, com escape hatch obrigatório para `comtypes` cru.**
+### 3.2 Saúde das dependências candidatas
+
+| | `uiautomation` (yinkaisheng) | `comtypes` (Enthought) |
+|---|---|---|
+| Mantenedor | 1 pessoa física, projeto de tempo livre | Enthought + 6 mantenedores |
+| Licença | Apache 2.0 | MIT |
+| Último release PyPI | 2.0.29, ago/2025 | 1.4.16, mar/2026 |
+| Cadência | esparsa (2 commits triviais em 10 meses) | ~2 meses |
+| Issues abertas | 154 | 98 |
+| Histórico | 6 releases *yanked* em sequência (2.0.21–2.0.26, abr/2025) | — |
+| Bus factor | **1** | vários |
+
+### 3.3 Decisão: `comtypes` puro, sem `uiautomation`
+
+**A base é `comtypes` + `GetModule("UIAutomationCore.dll")`. `uiautomation` não entra, nem em runtime nem como dependência.**
 
 Justificativa:
 
-1. `uiautomation` é um mapeamento praticamente 1:1 da API UIA — o que a spec descreve em termos de UIA traduz diretamente, sem reinterpretação. Isso reduz ambiguidade de implementação.
-2. Ele expõe o `IUIAutomationElement` subjacente em `control.Element`, permitindo usar `CreateCacheRequest` + `FindAllBuildCache` exatamente onde a performance importa (captura de árvore, §5.2). Ou seja: conveniência onde não custa, COM cru onde custa.
-3. `pywinauto` é rejeitado como base porque seu identificador principal é *best match* textual — inerentemente não determinístico e incompatível com o esquema de refs desta spec. Ele adiciona latência sem adicionar capacidade.
-4. `comtypes` puro é rejeitado como base pelo volume de boilerplate (condições, walkers, enums, tratamento de `HRESULT`), que multiplica a superfície de bugs num projeto onde o valor está na semântica das tools, não na plumbing COM.
+1. **A §2.2 é inegociável e a lib não a atende.** O servidor precisa de `CUIAutomation8` com `ConnectionTimeout`/`TransactionTimeout` para que **CA-23** (app travado → `TIMEOUT` ≤ 15 s) seja implementável. Só o caminho comtypes entrega isso.
+2. **Manter as duas significaria dois clientes COM no mesmo processo** — o do wrapper (sem timeouts) e o nosso (com) — cada um com sua própria visão de cache e seus próprios ponteiros. É uma fonte de bugs sem contrapartida.
+3. **O argumento clássico contra comtypes cru caiu.** O boilerplate temido (enums, IDs de propriedade e de pattern) é **gerado** do typelib: 626 símbolos prontos. O que resta escrever à mão é `TreeWalker`, construção de `IUIAutomationCondition` e mapeamento de `HRESULT` — que é o próprio produto, não plumbing descartável.
+4. **O que o wrapper ofereceria além disso, esta spec já rejeita.** Busca (§8.4) precisa ser determinística; envio de teclas (§8.9) tem sintaxe própria e liberação garantida de modificadores; esperas (§7.3) têm política própria de backoff e settle. A sobreposição útil é quase nula.
+5. `pywinauto` segue rejeitado pelo motivo original: identificador principal é *best match* textual, incompatível com o princípio 4 (determinismo) e com o esquema de refs.
 
-**Regra dura de implementação:** `uia_get_tree` e `uia_find_elements` **devem** usar `FindAllBuildCache` com `CacheRequest` contendo todas as propriedades necessárias e `AutomationElementMode.None` quando só os dados forem usados. Ler propriedade a propriedade em árvore de >100 nós é inaceitável (cada leitura é um RPC cross-process; a diferença é de ~10 s para ~0,3 s).
+**Regra dura de implementação (mantida e reforçada):** `uia_get_tree` e `uia_find_elements` **devem** usar `FindAllBuildCache` com `CacheRequest` contendo todas as propriedades necessárias, e ler exclusivamente as propriedades `Cached*`. Ler propriedade a propriedade (`Current*`) em árvore de >100 nós é inaceitável — cada leitura é um RPC cross-process.
+
+**Consequência para `uia/core.py`:** o módulo passa a ser dono de (a) instanciar `CUIAutomation8`/`IUIAutomation6` com os timeouts, (b) expor os `TreeWalker` de ControlView, (c) fabricar condições (`CreatePropertyCondition`, `CreateAndCondition`, `CreateTrueCondition`), (d) montar `CacheRequest` reutilizáveis, (e) traduzir `COMError.hresult` para os códigos da §9.2. Estimativa: 300–500 linhas.
 
 Dependências fixadas:
 
@@ -158,14 +170,17 @@ Dependências fixadas:
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.2.0",
-  "uiautomation>=2.0.20",
-  "comtypes>=1.4.6",
-  "psutil>=5.9",          # process name/pid confiável
-  "tomli-w>=1.0",         # persistência de config
+  "comtypes>=1.4.16",
+  "psutil>=5.9",          # process name/exe path confiável a partir do pid
 ]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 ```
 
-`psutil` é usado para resolver `pid → process name/exe path` de forma robusta (a UIA fornece só `ProcessId`).
+`psutil` é usado para resolver `pid → process name/exe path` de forma robusta (a UIA fornece só `ProcessId`). `tomli-w` foi removido: a §10.1 estabelece que a config é lida apenas no startup e nunca reescrita em runtime, e `tomllib` (leitura) é stdlib desde 3.11.
+
+**Interpretador de referência: Python 3.14.6 x64** — validado nas provas de conceito acima. O piso declarado continua 3.11 (`tomllib`, sintaxe de tipos), mas o desenvolvimento e os testes de aceitação rodam em 3.14.
 
 ---
 
@@ -174,7 +189,7 @@ dependencies = [
 | Requisito | Detalhe | Consequência se violado |
 |---|---|---|
 | SO | Windows 10 build 17763+ ou Windows 11 | `SetProcessDpiAwarenessContext` indisponível em builds antigas → usar `SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)` |
-| Python | 3.11+ **64-bit** | Python 32-bit consegue falar UIA com processos 64-bit, mas há degradação/limitações em propriedades nativas; exigir 64-bit |
+| Python | 3.14 x64 (piso 3.11) | Python 32-bit consegue falar UIA com processos 64-bit, mas há degradação/limitações em propriedades nativas; exigir 64-bit |
 | Sessão | Sessão interativa desbloqueada, console local | Tela bloqueada ou sessão RDP desconectada → árvore vazia. Retornar `SESSION_UNAVAILABLE` |
 | COM | STA por thread (§2.2) | `RPC_E_WRONG_THREAD`, crashes intermitentes |
 | DPI | Processo **deve** declarar Per-Monitor V2 antes de qualquer chamada UIA/Win32 | `BoundingRectangle` retorna coords virtualizadas; clique de fallback erra o alvo em telas com escala ≠ 100% |
@@ -1081,7 +1096,7 @@ Arquivo: `%APPDATA%\Claude\claude_desktop_config.json`
 
 Passos de instalação a documentar no README:
 
-1. `py -3.11 -m venv .venv` (Python 64-bit) e `.venv\Scripts\pip install -e .`
+1. `py -3.14 -m venv .venv` (Python 64-bit) e `.venv\Scripts\pip install -e .`
 2. Editar `config.toml`: preencher `[allowlist] processes`.
 3. Smoke test fora do Claude: `.venv\Scripts\python -u -m mcp_windows_uia --config config.toml --read-only` e enviar um `initialize` + `tools/list` por stdin (ou usar `mcp dev`).
 4. Adicionar o bloco acima ao `claude_desktop_config.json` e reiniciar o Claude Desktop **completamente** (encerrar pela bandeja, não só fechar a janela).
