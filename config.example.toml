@@ -23,7 +23,9 @@ processes = ["consent.exe", "CredentialUIBroker.exe", "LogonUI.exe",
 title_patterns = ["(?i)(senha|password|banco|banking|carteira|wallet|seed phrase)"]
 
 [audit]
-dir = "%LOCALAPPDATA%\mcp-windows-uia\audit"
+# String literal do TOML (aspas simples): nao processa escapes, entao barras
+# invertidas de caminho Windows funcionam sem precisar duplicar.
+dir = '%LOCALAPPDATA%\mcp-windows-uia\audit'
 retain_days = 30
 log_values = "redacted"   # "full" | "redacted" | "none"
 

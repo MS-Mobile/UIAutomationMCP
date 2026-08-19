@@ -119,7 +119,10 @@ processes = ["consent.exe", "CredentialUIBroker.exe", "LogonUI.exe",
 title_patterns = ["(?i)(senha|password|banco|banking|carteira|wallet|seed phrase)"]
 
 [audit]
-dir = "%LOCALAPPDATA%\\mcp-windows-uia\\audit"
+# String literal do TOML (aspas simples): nao processa escapes, entao barras
+# invertidas de caminho Windows funcionam sem precisar duplicar. Usar aspas
+# duplas aqui exige "\\" e e uma fonte recorrente de TOML invalido.
+dir = '%LOCALAPPDATA%\mcp-windows-uia\audit'
 retain_days = 30
 log_values = "redacted"   # "full" | "redacted" | "none"
 
@@ -3403,9 +3406,19 @@ def main() -> None:
 
     from .config import load_config
     from .context import ServerContext, set_context
+    from .errors import ToolError
     from .server import mcp
 
-    config = load_config(args.config, force_read_only=args.read_only)
+    # Config invalida e erro do usuario, nao bug: mensagem acionavel em stderr,
+    # nunca um traceback. O agente nem chega a ver isso — o cliente MCP so ve o
+    # servidor morrer, entao a mensagem precisa ser legivel por gente.
+    try:
+        config = load_config(args.config, force_read_only=args.read_only)
+    except ToolError as exc:
+        logging.error("%s", exc.message)
+        logging.error("%s", exc.hint)
+        raise SystemExit(2) from None
+
     ctx = ServerContext(config)
     ctx.start()
     set_context(ctx)
@@ -3504,8 +3517,14 @@ def _framed(payload: dict) -> bytes:
     return json.dumps(payload).encode("utf-8") + b"\n"
 
 
-def _conversar(config: Path, mensagens: list[dict], espera_s: float = 30.0) -> tuple[bytes, bytes]:
-    """Sobe o servidor, envia as mensagens por stdin e devolve (stdout, stderr) crus."""
+def _conversar(config: Path, mensagens: list[dict], espera_s: float = 40.0) -> tuple[bytes, bytes]:
+    """Sobe o servidor, conversa por stdin/stdout e devolve (stdout, stderr) crus.
+
+    Mantem o stdin ABERTO ate ter lido a resposta de cada requisicao com id. Fechar
+    o stdin antes disso (o que subprocess.communicate faz) leva o servidor a iniciar
+    o shutdown com a chamada ainda em voo, e a requisicao volta como
+    -32000 'Connection closed' em vez do resultado.
+    """
     env = dict(os.environ, PYTHONUTF8="1")
     proc = subprocess.Popen(
         [str(PYTHON), "-u", "-m", "mcp_windows_uia", "--config", str(config)],
@@ -3515,13 +3534,50 @@ def _conversar(config: Path, mensagens: list[dict], espera_s: float = 30.0) -> t
         cwd=str(RAIZ),
         env=env,
     )
+    assert proc.stdin is not None and proc.stdout is not None
+
+    esperados = {m["id"] for m in mensagens if "id" in m}
+    linhas: list[bytes] = []
+    limite = time.monotonic() + espera_s
+
     try:
-        out, err = proc.communicate(input=b"".join(_framed(m) for m in mensagens), timeout=espera_s)
+        proc.stdin.write(b"".join(_framed(m) for m in mensagens))
+        proc.stdin.flush()
+
+        vistos: set[int] = set()
+        while vistos != esperados:
+            if time.monotonic() > limite:
+                raise subprocess.TimeoutExpired(proc.args, espera_s)
+            linha = proc.stdout.readline()
+            if not linha:  # servidor fechou stdout
+                break
+            linhas.append(linha)
+            if linha.strip():
+                try:
+                    msg = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue  # sujeira em stdout: o teste do CA-22 e quem acusa
+                if isinstance(msg, dict) and "id" in msg:
+                    vistos.add(msg["id"])
+    except (subprocess.TimeoutExpired, OSError):
+        proc.kill()
+        _, err = proc.communicate()
+        pytest.fail(
+            f"servidor nao respondeu em {espera_s}s. "
+            f"stdout parcial:\n{b''.join(linhas).decode(errors='replace')}\n"
+            f"stderr:\n{err.decode(errors='replace')}"
+        )
+
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        resto, err = proc.communicate(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
-        out, err = proc.communicate()
-        pytest.fail(f"servidor nao respondeu em {espera_s}s. stderr:\n{err.decode(errors='replace')}")
-    return out, err
+        resto, err = proc.communicate()
+    return b"".join(linhas) + resto, err
 
 
 INIT = {
