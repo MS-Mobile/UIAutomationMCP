@@ -122,11 +122,21 @@ class Automation:
         scope: int | None = None,
         element_mode: int | None = None,
     ) -> Any:
+        """CacheRequest para FindAllBuildCache.
+
+        `scope` aqui NAO e o escopo da busca — esse vai no primeiro argumento de
+        FindAllBuildCache. Este e por-elemento: "para CADA elemento encontrado,
+        pre-carregue tambem esse tanto da subarvore DELE". Por isso o default e
+        TreeScope_Element: com Subtree, uma busca que casa N elementos pede N
+        subarvores completas, a transacao estoura o TransactionTimeout de 10 s e a
+        chamada aflora como E_FAIL (0x80004005). Medido no WhatsApp Desktop:
+        cache=Element OK em 18 s / 24409 nos; cache=Subtree falha apos ~9,5 s.
+        """
         U = self.UIA
         cr = self.iuia.CreateCacheRequest()
         for prop in properties:
             cr.AddProperty(prop)
-        cr.TreeScope = U.TreeScope_Subtree if scope is None else scope
+        cr.TreeScope = U.TreeScope_Element if scope is None else scope
         # ControlView, nao RawView: RawView infla a arvore com nos irrelevantes (§5.2).
         cr.TreeFilter = self.iuia.ControlViewCondition
         cr.AutomationElementMode = (

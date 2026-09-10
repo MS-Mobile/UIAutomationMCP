@@ -60,6 +60,38 @@ def test_cache_request_aceita_as_propriedades_da_spec(sta: None) -> None:
     assert a.build_cache_request(a.tree_props()) is not None
 
 
+def test_cache_request_usa_treescope_element_por_padrao(sta: None) -> None:
+    """O TreeScope do CacheRequest e por-elemento, nao o escopo da busca.
+
+    Ele significa "para CADA elemento encontrado, pre-carregue tambem esse tanto da
+    subarvore DELE". Com TreeScope_Subtree, uma busca que casa N elementos pede N
+    subarvores completas: a transacao estoura o TransactionTimeout de 10 s e a
+    chamada aflora como E_FAIL (0x80004005). Medido no WhatsApp Desktop: cache=Element
+    OK; cache=Descendants e cache=Subtree falham apos ~9,5 s.
+
+    O escopo da BUSCA (Subtree) vai no primeiro argumento de FindAllBuildCache.
+    """
+    a = core.automation()
+    cr = a.build_cache_request(a.tree_props())
+    assert cr.TreeScope == a.UIA.TreeScope_Element
+
+
+def test_findallbuildcache_com_cache_request_padrao_nao_falha(sta: None) -> None:
+    """Regressao do E_FAIL 0x80004005 causado por cache TreeScope_Subtree.
+
+    Escopo de busca Children de proposito: Subtree a partir da janela do desktop
+    enumeraria a area de trabalho inteira, caro demais para teste unitario.
+    """
+    import ctypes
+
+    a = core.automation()
+    hwnd = ctypes.windll.user32.GetDesktopWindow()
+    alvo = a.element_from_handle(hwnd)
+    cr = a.build_cache_request(a.tree_props())
+    achados = alvo.FindAllBuildCache(a.UIA.TreeScope_Children, a.true_condition, cr)
+    assert achados.Length > 0
+
+
 def test_condicoes_nativas_sao_construiveis(sta: None) -> None:
     a = core.automation()
     c1 = a.property_condition(a.UIA.UIA_ControlTypePropertyId, 50000)
