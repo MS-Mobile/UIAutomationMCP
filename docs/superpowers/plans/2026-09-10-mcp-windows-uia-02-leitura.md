@@ -656,7 +656,7 @@ def test_aprofundamento_respeita_o_teto_duro_de_40() -> None:
 
 
 def test_aprofundamento_respeita_o_max_nodes() -> None:
-    r = percorrer("raiz", arvore_falsa(3, 30), so_abaixo_de(25),
+    r = percorrer("raiz", arvore_falsa(3, 4), so_abaixo_de(3),
                   CaptureBudget(max_nodes=5, max_depth=2, depth_is_default=True))
     assert len(r.emitidos) <= 5
 
@@ -665,6 +665,19 @@ def test_visitados_conta_mais_que_emitidos_quando_ha_filtro() -> None:
     r = percorrer("raiz", arvore_falsa(2, 4), so_abaixo_de(3),
                   CaptureBudget(max_nodes=100, max_depth=4))
     assert r.visitados > len(r.emitidos)
+
+
+def test_teto_de_visitados_impede_explosao_exponencial() -> None:
+    """Filtro restritivo + aprofundamento adaptativo nao pode virar busca infinita.
+
+    Sem este teto, ramificacao 3 descendo ate o nivel 25 visita 3^25 nos.
+    """
+    r = percorrer("raiz", arvore_falsa(3, 30), so_abaixo_de(25),
+                  CaptureBudget(max_nodes=5, max_depth=2, max_visited=500,
+                                depth_is_default=True))
+    assert r.visitados <= 500
+    assert r.exhausted_budget is True
+    assert r.truncado is True
 
 
 def test_arvore_vazia_nao_explode() -> None:
@@ -713,6 +726,11 @@ class CaptureBudget:
     max_nodes: int = DEFAULT_MAX_NODES
     max_depth: int = DEFAULT_MAX_DEPTH
     max_children_per_node: int = DEFAULT_MAX_CHILDREN
+    # Teto de nos VISITADOS, nao emitidos. Sem ele, um filtro que rejeita tudo somado
+    # ao aprofundamento adaptativo faz a largura explodir exponencialmente: a busca
+    # segue descendo procurando algo que passe e nunca para. Mesmo principio do teto
+    # interno da §8.4.
+    max_visited: int = 5000
     # True quando o chamador NAO informou max_depth. So entao aprofundamos (§6.1).
     depth_is_default: bool = False
 
@@ -723,6 +741,7 @@ class CaptureResult:
     elididos: dict[Any, int] = field(default_factory=dict)
     visitados: int = 0
     truncado: bool = False
+    exhausted_budget: bool = False
     auto_deepened: bool = False
     depth_reached: int = 0
     fila_restante: list[tuple[Any, int]] = field(default_factory=list)
@@ -755,6 +774,14 @@ def percorrer(
 
         if len(r.emitidos) >= orcamento.max_nodes:
             r.truncado = bool(fila)
+            r.fila_restante = fila
+            return r
+
+        if r.visitados >= orcamento.max_visited:
+            # Gastamos o orcamento de travessia sem encher o de emissao: a arvore e
+            # grande e o filtro e restritivo. Para e sinaliza, em vez de moer.
+            r.truncado = True
+            r.exhausted_budget = True
             r.fila_restante = fila
             return r
 
@@ -797,7 +824,7 @@ def _filhos_limitados(
 - [ ] **Step 4: Rodar os testes unitários**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_uia_tree.py -q`
-Expected: PASS — 12 passed
+Expected: PASS — 13 passed
 
 - [ ] **Step 5: Commit da lógica pura**
 
