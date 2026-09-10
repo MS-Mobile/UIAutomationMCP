@@ -264,14 +264,58 @@ Regra de redação: se `password ∈ st`, `val` **nunca** é retornado; em seu l
 
 ### 5.2 Captura e cache
 
-`uia_get_tree` executa:
+**Distinção que gera bug se ignorada:** `FindAllBuildCache(escopo_da_busca, condição, cache_request)` tem *dois* escopos independentes. O primeiro argumento diz **quais elementos achar**. O `TreeScope` do `CacheRequest` diz, para **cada elemento achado**, quanto da subárvore *dele* pré-carregar junto. Não são a mesma coisa e não devem receber o mesmo valor.
+
+`CacheRequest.TreeScope` **deve ser `TreeScope_Element`**. Qualquer valor que inclua `Descendants` faz uma busca que casa N elementos pedir N subárvores completas numa única transação COM; ela estoura o `TransactionTimeout` de 10 s (§2.2) e aflora como `E_FAIL` (`0x80004005`).
+
+Medido em 2026-09-10 no WhatsApp Desktop (WebView2, 24409 nós na ControlView), com find=`TreeScope_Subtree` a partir da janela:
+
+| `CacheRequest.TreeScope` | Resultado |
+|---|---|
+| `Element` | OK — 24409 nós em 18,2 s; ler `Cached*` dos 24409 leva **198 ms** |
+| `Children` | OK, porém 22,5 s |
+| `Descendants` | `E_FAIL` após ~13,4 s |
+| `Subtree` | `E_FAIL` após ~13,5 s |
+
+Não é restrição categórica: num elemento folha, `cache=Subtree` funciona. A falha é de volume, e o tempo até falhar coincide com o `TransactionTimeout` que nós mesmos configuramos.
+
+#### Algoritmo obrigatório: captura limitada por nível
+
+A segunda lição da medição é que **uma única busca com find=Subtree é inviável mesmo com o cache correto**: 18,2 s excede o teto de 15 s do `UiaWorker` (§2.2), então `uia_get_tree` devolveria `TIMEOUT` justamente nos apps mais interessantes. E ela paga por 24409 nós para entregar 200 — o orçamento da §6.1 era aplicado *depois* de buscar tudo.
+
+**O orçamento é aplicado durante o percurso, não depois.** `uia_get_tree` executa:
 
 1. Resolve a janela (por `window_ref`, `hwnd` ou `title`).
-2. Cria `CacheRequest` com `TreeScope_Subtree`, propriedades: `Name`, `AutomationId`, `ClassName`, `ControlType`, `IsEnabled`, `IsOffscreen`, `IsKeyboardFocusable`, `HasKeyboardFocus`, `BoundingRectangle`, `RuntimeId`, `ProcessId`, `IsPassword`, `ToggleToggleState`, `ExpandCollapseExpandCollapseState`, `SelectionItemIsSelected`, `ValueValue`, `ValueIsReadOnly`, `RangeValueValue`, e `IsXxxPatternAvailable` para os patterns da tabela.
-3. `AutomationElementMode = Full` (necessário para depois obter patterns) e `TreeFilter = ControlViewCondition` (não `RawView` — RawView infla a árvore com nós irrelevantes).
-4. `FindAllBuildCache` a partir da raiz da janela.
-5. Percorre o resultado **cacheado** (`Cached*` properties — zero RPC adicional), aplica filtro (§6.2) e orçamento (§6.1).
-6. Registra cada nó retornado no `RefStore` e emite a lista plana.
+2. Monta **uma vez** o `CacheRequest`, reusado em todas as chamadas do passo 4:
+   - Propriedades: `Name`, `AutomationId`, `ClassName`, `ControlType`, `IsEnabled`, `IsOffscreen`, `IsKeyboardFocusable`, `HasKeyboardFocus`, `BoundingRectangle`, `RuntimeId`, `ProcessId`, `IsPassword`, `ToggleToggleState`, `ExpandCollapseExpandCollapseState`, `SelectionItemIsSelected`, `ValueValue`, `ValueIsReadOnly`, `RangeValueValue`, e `IsXxxPatternAvailable` para os patterns da tabela da §5.1.
+   - `TreeScope = TreeScope_Element` — regra acima, inegociável.
+   - `TreeFilter = ControlViewCondition` (não `RawView`: infla a árvore com nós irrelevantes).
+   - `AutomationElementMode = Full` (necessário para obter patterns depois).
+3. Inicializa a fila de percurso com a raiz da captura (`root_ref`, ou o elemento da janela).
+4. **Enquanto** houver nós na fila **e** `emitidos < max_nodes` **e** `profundidade < max_depth`:
+   1. Desenfileira o nó e chama `FindAllBuildCache(TreeScope_Children, ControlViewCondition, cache_request)`.
+   2. Lê **apenas** propriedades `Cached*` dos filhos — zero RPC adicional.
+   3. Aplica `max_children_per_node` fatiando o array retornado (sem RPC); anota `"n": <restantes>` no nó pai.
+   4. Aplica o filtro (§6.2) no cliente, sobre as propriedades já cacheadas.
+   5. Enfileira os filhos sobreviventes para o próximo nível.
+5. Registra cada nó emitido no `RefStore` e emite a lista plana.
+
+O percurso é em **largura por níveis, ordem de documento dentro do nível**, como a §6.1 já exige — e agora a §5.2 o implementa em vez de contradizê-lo.
+
+Custo: **uma chamada COM por nó-pai visitado**, cada uma trazendo todos os filhos com todas as propriedades de uma vez. Isso satisfaz a regra dura da §3.3: o que ela proíbe é ler propriedade a propriedade (`Current*`), que custaria ~50 RPCs por nó.
+
+Medido na mesma janela:
+
+| Orçamento | Nós emitidos | Chamadas COM | Tempo |
+|---|---|---|---|
+| `max_nodes=200`, `max_depth=12` | 46 | 44 | **159 ms** |
+| `max_nodes=600`, `max_depth=20` | 287 | 213 | 375 ms |
+| `max_nodes=1500`, `max_depth=40` | 631 | 632 | 721 ms |
+| *(referência)* find=Subtree sem limite | 24409 | 1 | **18205 ms** |
+
+**Armadilha a evitar:** não empurrar o filtro da §6.2 para dentro da condição do `FindAllBuildCache`. O percurso precisa **descer através** de containers que não passam no filtro para alcançar os nós que passam; uma condição nativa restritiva poda o caminho e o conteúdo some. A condição do percurso é sempre a ControlView; o filtro roda no cliente, sobre propriedades já cacheadas, a custo zero. (A otimização por condição nativa da §8.4 é legítima porque lá a busca é *plana* — não precisa atravessar nada.)
+
+**Pendência aberta para a §6.1 — `max_depth`:** o default de 12 foi calibrado para app nativo. Árvores de WebView2/Electron são muito mais fundas: a do WhatsApp tem profundidade real 45, e com `max_depth=12` a captura devolve 46 nós, **nenhum deles conteúdo de conversa** — o conteúdo mora abaixo do nível 12. O default atual torna `uia_get_tree` inútil nessa classe de app. Decidir na §6.1 antes do Plano 2.
 
 ---
 
