@@ -315,7 +315,7 @@ Medido na mesma janela:
 
 **Armadilha a evitar:** não empurrar o filtro da §6.2 para dentro da condição do `FindAllBuildCache`. O percurso precisa **descer através** de containers que não passam no filtro para alcançar os nós que passam; uma condição nativa restritiva poda o caminho e o conteúdo some. A condição do percurso é sempre a ControlView; o filtro roda no cliente, sobre propriedades já cacheadas, a custo zero. (A otimização por condição nativa da §8.4 é legítima porque lá a busca é *plana* — não precisa atravessar nada.)
 
-**Pendência aberta para a §6.1 — `max_depth`:** o default de 12 foi calibrado para app nativo. Árvores de WebView2/Electron são muito mais fundas: a do WhatsApp tem profundidade real 45, e com `max_depth=12` a captura devolve 46 nós, **nenhum deles conteúdo de conversa** — o conteúdo mora abaixo do nível 12. O default atual torna `uia_get_tree` inútil nessa classe de app. Decidir na §6.1 antes do Plano 2.
+**Consequência para `max_depth` (resolvida na §6.1):** o default de 12 foi calibrado para app nativo. Árvores de WebView2/Electron são muito mais fundas — a do WhatsApp tem profundidade real 45, e parar em 12 devolve 46 nós, **nenhum deles conteúdo de conversa**. Por isso o percurso aprofunda sozinho quando para raso sem achar nada: ver §6.1, *Aprofundamento adaptativo*.
 
 ---
 
@@ -326,7 +326,7 @@ Medido na mesma janela:
 | Parâmetro | Default | Máximo | Efeito |
 |---|---|---|---|
 | `max_nodes` | 200 | 1500 | Nº de nós na resposta |
-| `max_depth` | 12 | 40 | Profundidade máxima percorrida |
+| `max_depth` | 12 (adaptativo) | 40 | Profundidade máxima percorrida; aprofunda sozinho se parar raso sem achar nada — ver abaixo |
 | `max_chars` (texto) | 6000 | 40000 | Caracteres de conteúdo textual |
 | `max_children_per_node` | 30 | 500 | Irmãos por container antes de elidir |
 | Name truncation | 120 chars | — | Sufixo `…` |
@@ -347,6 +347,32 @@ Comportamento ao estourar:
 ```
 
 **Regra dura:** o servidor **nunca** retorna árvore não truncada acima de 1500 nós, mesmo com `max_nodes` maior. Ele corta e sinaliza.
+
+
+#### Aprofundamento adaptativo (`max_depth`)
+
+O default de 12 serve app nativo. Árvore de WebView2/Electron é bem mais funda — a do WhatsApp tem profundidade real 45, e parar em 12 devolve 46 nós sem nenhum conteúdo de conversa. Em vez de subir o default e encarecer todo app nativo, o percurso **continua descendo quando parou raso sem achar nada**.
+
+Regra: ao atingir `max_depth` com a fila de percurso **não vazia** e **zero** nós aprovados pelo filtro (§6.2), o percurso não para — segue drenando a fila nível a nível até a primeira das condições:
+
+| Para quando | |
+|---|---|
+| ≥1 nó passa no filtro | achou o que procurava |
+| `max_nodes` atingido | orçamento manda |
+| profundidade 40 | teto duro |
+| fila vazia | acabou a árvore |
+
+**Não é nova captura.** A fila do percurso em largura já está montada; aprofundar é continuar a drenagem. Zero RPC desperdiçado, nada é revisitado.
+
+**Só vale para o default.** Se o chamador passou `max_depth` explicitamente, o valor é respeitado ao pé da letra — o agente pediu profundidade rasa e recebe profundidade rasa.
+
+A resposta declara o que houve, para o agente não achar que a árvore é rasa:
+
+```json
+"stats": {"returned": 631, "visited": 1204, "truncated": false,
+          "auto_deepened": true, "depth_reached": 25, "depth_requested": 12}
+```
+
 
 ### 6.2 Filtros (`filter`)
 
@@ -536,7 +562,7 @@ Notas: `allowed:false` significa que a janela existe mas está fora da allowlist
 | `window_ref` | string | sim¹ | — | Ref de janela de `uia_list_windows` |
 | `root_ref` | string | não | — | Captura a partir deste elemento (¹ dispensa `window_ref`) |
 | `filter` | enum | não | `"interactive"` | `interactive` \| `content` \| `all` \| `landmarks` |
-| `max_depth` | int | não | `12` | 1–40 |
+| `max_depth` | int | não | `12` | 1–40. Omitido, aprofunda sozinho se parar raso sem achar nada (§6.1); informado, e respeitado ao pe da letra |
 | `max_nodes` | int | não | `200` | 1–1500 |
 | `max_children_per_node` | int | não | `30` | 1–500 |
 | `cursor` | string | não | — | Continua captura truncada anterior |
