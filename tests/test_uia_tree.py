@@ -177,3 +177,32 @@ def test_paginacao_atravessa_o_teto_de_1500_nos() -> None:
     pagina = r.emitidos[1500:]
     assert len(pagina) == 200
     assert r.truncado is True
+
+
+def test_corte_por_profundidade_marca_truncado() -> None:
+    """Regressao: `truncado` era ATRIBUIDO a cada no, nao acumulado.
+
+    Como o ultimo no processado no teto costuma ter fila vazia, `bool(fila)` zerava a
+    marca deixada pelos anteriores. Medido no WhatsApp Desktop: 46 de 437 nos
+    devolvidos com truncated=false.
+    """
+    r = percorrer("raiz", arvore_falsa(2, 10), sempre_passa,
+                  CaptureBudget(max_nodes=10000, max_depth=3))
+    assert r.truncado is True
+    assert r.cortado_por_profundidade is True
+
+
+def test_arvore_que_termina_antes_do_teto_nao_e_truncada() -> None:
+    """A marca conservadora nao pode virar 'truncado' em toda captura."""
+    r = percorrer("raiz", arvore_falsa(2, 2), sempre_passa,
+                  CaptureBudget(max_nodes=10000, max_depth=8))
+    assert r.truncado is False
+    assert r.cortado_por_profundidade is False
+
+
+def test_corte_por_orcamento_nao_e_corte_por_profundidade() -> None:
+    """As duas causas pedem acoes opostas do agente, entao nao podem se confundir."""
+    r = percorrer("raiz", arvore_falsa(4, 6), sempre_passa,
+                  CaptureBudget(max_nodes=10, max_depth=30))
+    assert r.truncado is True
+    assert r.cortado_por_profundidade is False

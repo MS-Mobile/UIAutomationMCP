@@ -57,3 +57,18 @@ def test_captura_devolve_refs_no_formato_da_spec(bloco_de_notas) -> None:
     for n in r["nodes"]:
         assert n["ref"].startswith("w")
         assert "-e" in n["ref"]
+
+
+def test_corte_por_profundidade_manda_aumentar_max_depth(bloco_de_notas) -> None:
+    """A dica precisa apontar para o lado certo.
+
+    A dica generica manda estreitar ('a smaller max_depth'), o que e conselho invertido
+    quando o corte foi por profundidade — e esse e justamente o caso dos apps Electron
+    e WebView2, onde o conteudo real mora fundo.
+    """
+    from mcp_windows_uia.uia.tree import capturar_janela
+
+    r = capturar_janela(bloco_de_notas.hwnd, filtro="all", max_nodes=1000, max_depth=2)
+
+    assert r["stats"]["truncated"] is True
+    assert "larger max_depth" in r["stats"]["hint"]

@@ -26,6 +26,12 @@ DEFAULT_MAX_DEPTH = 12
 DEFAULT_MAX_CHILDREN = 30
 DEFAULT_MAX_CHARS = 6000
 
+DEPTH_HINT = (
+    "Stopped at max_depth before the tree ended. In Electron and WebView2 apps the real "
+    "content usually sits deeper than the default: retry with a larger max_depth, and "
+    "keep filter='interactive' to stay within budget."
+)
+
 TRUNCATION_HINT = (
     "Response truncated. Narrow with filter='interactive', a smaller max_depth, root_ref, "
     "or call uia_find_elements instead of dumping the tree."

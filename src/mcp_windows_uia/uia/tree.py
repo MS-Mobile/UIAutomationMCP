@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..budget import (
+    DEPTH_HINT,
     DEFAULT_MAX_CHILDREN,
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_NODES,
@@ -47,6 +48,9 @@ class CaptureResult:
     visitados: int = 0
     truncado: bool = False
     exhausted_budget: bool = False
+    # Truncou por bater no teto de profundidade (e nao por encher o de nos). Muda a
+    # dica dada ao agente: aqui ele precisa de max_depth MAIOR, nao menor.
+    cortado_por_profundidade: bool = False
     auto_deepened: bool = False
     depth_reached: int = 0
     fila_restante: list[tuple[Any, int]] = field(default_factory=list)
@@ -99,8 +103,19 @@ def percorrer(
                 and teto_profundidade < HARD_MAX_DEPTH
             )
             if not pode_aprofundar:
+                # Marca ACUMULATIVAMENTE. A versao anterior atribuia `bool(fila)`, e cada
+                # no seguinte sobrescrevia o anterior: como o ultimo no do nivel costuma
+                # ter fila vazia, o resultado saia `false`. Medido no WhatsApp Desktop:
+                # 46 de 437 nos devolvidos com truncated=false. Mentir dizendo que a
+                # arvore acabou e o pior erro possivel — o agente conclui que viu tudo.
+                #
+                # Conservador de proposito: nao chamamos filhos_de aqui (seria um RPC por
+                # no de fronteira), entao uma folha exatamente no teto e marcada como
+                # truncada. Falso positivo custa uma chamada a mais; falso negativo custa
+                # conteudo perdido em silencio.
+                r.truncado = True
+                r.cortado_por_profundidade = True
                 r.fila_restante = [(no, nivel), *fila]
-                r.truncado = bool(fila)
                 continue
             teto_profundidade = min(teto_profundidade + 1, HARD_MAX_DEPTH)
             r.auto_deepened = True
@@ -274,6 +289,9 @@ def capturar_janela(
         stats["auto_deepened"] = True
         stats["depth_requested"] = DEFAULT_MAX_DEPTH
     if r.truncado:
-        stats["hint"] = TRUNCATION_HINT
+        # Corte por orcamento de nos pede filtro mais estreito; corte por profundidade
+        # pede o contrario. Uma dica so serviria de conselho errado para metade dos casos.
+        por_orcamento = len(r.emitidos) >= orcamento.max_nodes or r.exhausted_budget
+        stats["hint"] = TRUNCATION_HINT if por_orcamento else DEPTH_HINT
 
     return {"nodes": nodes, "stats": stats}
