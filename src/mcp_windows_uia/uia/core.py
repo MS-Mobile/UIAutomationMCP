@@ -13,10 +13,15 @@ from __future__ import annotations
 
 import re
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import comtypes
 import comtypes.client
+
+from ..budget import HARD_MAX_CHILDREN, HARD_MAX_DEPTH
+from .search import TETO_DE_BUSCA
 
 CONNECTION_TIMEOUT_MS = 10000
 TRANSACTION_TIMEOUT_MS = 10000
@@ -69,6 +74,19 @@ def pattern_availability_props() -> dict[str, int]:
         }
         _local.pattern_props = cache
     return cache
+
+
+@dataclass(frozen=True, slots=True)
+class Achados:
+    """Resultado bruto de uma busca da §8.4.
+
+    `exhaustive` e o compromisso honesto com o agente: False significa "sobrou
+    janela que eu nao olhei", e ai um zero-match nao prova ausencia.
+    """
+
+    elementos: list[Any]
+    visitados: int
+    exhaustive: bool
 
 
 class Automation:
@@ -156,6 +174,109 @@ class Automation:
         for cond in conditions[1:]:
             resultado = self.iuia.CreateAndCondition(resultado, cond)
         return resultado
+
+    # -------------------------------------------------------------- busca (8.4)
+
+    def condicao_de_criterios(self, criterios: Any) -> tuple[Any, bool]:
+        """Traduz o que da para condicao nativa. Spec §8.4.
+
+        So criterios EXATOS viram condicao — o provider filtra do lado dele, o que e
+        muito mais barato que trazer a arvore. contains/starts_with/regex e
+        text_contains ficam para o filtro no cliente.
+
+        Devolve `(condicao, restringe)`. O segundo item existe porque a diferenca
+        entre "condicao que poda" e TrueCondition e a diferenca entre um RPC e
+        enumerar a janela inteira: quem chama precisa escolher a estrategia a partir
+        dela. E ele nao pode ser deduzido so olhando os criterios — um
+        `control_type` que nao existe no typelib nao vira condicao nenhuma.
+        """
+        U = self.UIA
+        condicoes: list[Any] = []
+
+        if criterios.automation_id:
+            condicoes.append(
+                self.property_condition(U.UIA_AutomationIdPropertyId, criterios.automation_id)
+            )
+        if criterios.class_name:
+            condicoes.append(
+                self.property_condition(U.UIA_ClassNamePropertyId, criterios.class_name)
+            )
+        if criterios.control_type:
+            tipo_id = next(
+                (
+                    cid
+                    for cid, nome in control_type_names().items()
+                    if nome == criterios.control_type
+                ),
+                None,
+            )
+            if tipo_id is not None:
+                condicoes.append(self.property_condition(U.UIA_ControlTypePropertyId, tipo_id))
+        if criterios.name and criterios.match == "exact":
+            condicoes.append(self.property_condition(U.UIA_NamePropertyId, criterios.name))
+
+        return self.and_conditions(*condicoes), bool(condicoes)
+
+    def buscar_plano(self, hwnd: int, condicao: Any, *, teto: int = TETO_DE_BUSCA) -> Achados:
+        """FindAll cacheado dentro de uma janela. Busca PLANA — nao atravessa nada.
+
+        Diferente do percurso da §5.2, aqui a condicao nativa e legitima: nao ha
+        travessia a podar. Um unico RPC traz todos os candidatos ja com propriedades.
+
+        Exige uma condicao que RESTRINJA. Com TrueCondition o FindAll enumera todos
+        os descendentes antes de devolver e o `teto` nao economiza nada — o custo ja
+        foi pago. Esse caso e de `varrer_descendentes`.
+        """
+        cr = self.build_cache_request(self.tree_props())
+        raiz = self.element_from_handle(hwnd)
+        # Sem try/except: um FindAll que falha num app travado precisa aflorar como
+        # TIMEOUT/UIA_COM_ERROR (o UiaWorker converte), nao virar "nao encontrei".
+        achados = raiz.FindAllBuildCache(self.UIA.TreeScope_Descendants, condicao, cr)
+        total = achados.Length
+        return Achados(
+            elementos=[achados.GetElement(i) for i in range(min(total, teto))],
+            visitados=total,
+            exhaustive=total <= teto,
+        )
+
+    def varrer_descendentes(
+        self,
+        hwnd: int,
+        *,
+        aceita: Callable[[Any], bool],
+        max_resultados: int,
+        teto: int = TETO_DE_BUSCA,
+        max_depth: int = HARD_MAX_DEPTH,
+    ) -> Achados:
+        """Varredura por nivel com teto de visita. Ramo sem criterio nativo da §8.4.
+
+        Reusa o `percorrer` da §5.2 de proposito: o freio precisa ser aplicado
+        DURANTE a descida. E tambem para assim que junta `max_resultados`, entao o
+        caso comum (o alvo esta nos primeiros niveis) custa uma fracao da janela.
+        """
+        from .tree import CaptureBudget, filhos_cacheados, percorrer
+
+        cr = self.build_cache_request(self.tree_props())
+        raiz = self.element_from_handle_build_cache(hwnd, cr)
+        r = percorrer(
+            raiz,
+            filhos_cacheados(self, cr),
+            lambda elem, _nivel: aceita(elem),
+            CaptureBudget(
+                max_nodes=max_resultados,
+                max_depth=max_depth,
+                max_children_per_node=HARD_MAX_CHILDREN,
+                max_visited=teto,
+                depth_is_default=False,
+            ),
+        )
+        return Achados(
+            elementos=[elem for elem, _nivel in r.emitidos],
+            visitados=r.visitados,
+            # Irmaos elididos tambem sao janela nao olhada — nao da para dizer que
+            # a busca foi exaustiva tendo cortado filhos.
+            exhaustive=not r.truncado and not r.elididos,
+        )
 
     # ----------------------------------------------------------------- elementos
 

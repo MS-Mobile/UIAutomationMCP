@@ -25,6 +25,7 @@ from pydantic import Field
 from .budget import decode_cursor, encode_cursor
 from .context import ServerContext, context
 from .errors import POLICY_DENIALS, Code, ToolError
+from .uia.search import Criterios
 from .uia.windows import WindowInfo, enumerate_windows, server_is_elevated, window_is_alive
 
 _log = logging.getLogger(__name__)
@@ -402,5 +403,218 @@ async def uia_get_tree(
             max_children_per_node=max_children_per_node,
             cursor=cursor,
             verbose=verbose,
+        )
+    )
+
+
+# --------------------------------------------------------------------------- 8.4
+
+
+def _trilha_ancestral(automation: Any, elem: Any, *, proprio: str, niveis: int = 5) -> str:
+    """Trilha legivel dos ancestrais mais o proprio elemento, max 5 niveis (§8.4).
+
+    Sobe pelo ControlViewWalker. Custa ate 5 RPCs de `Current*` por match, o que so
+    vale porque max_results e pequeno — e evita uma segunda chamada do agente so
+    para desambiguar dois botoes de mesmo nome (CA-24). Medido no Bloco de Notas:
+    ~5 ms por elemento.
+
+    Para no elemento raiz do desktop: prefixar todo path com o Pane da area de
+    trabalho gastaria um segmento em todo match sem distinguir nada.
+    """
+    from .uia.core import control_type_name
+
+    trilha: list[str] = [proprio]
+    atual = elem
+    for _ in range(niveis):
+        try:
+            pai = automation.control_walker.GetParentElement(atual)
+        except Exception:
+            break
+        # Ponteiro COM pode ser NULL e falsy: testar antes de desreferenciar.
+        if not pai:
+            break
+        try:
+            if automation.iuia.CompareElements(pai, automation.root):
+                break
+            rotulo = control_type_name(pai.CurrentControlType)
+            nome = pai.CurrentName or ""
+        except Exception:
+            break
+        trilha.append(f"{rotulo}[{nome}]" if nome else rotulo)
+        atual = pai
+    return " > ".join(reversed(trilha))
+
+
+def find_elements_impl(
+    ctx: ServerContext,
+    *,
+    window_ref: str,
+    criterios: Criterios,
+    only_interactive: bool,
+    max_results: int,
+) -> dict[str, Any]:
+    """Corpo sincrono de uia_find_elements. Roda na thread do worker.
+
+    Duas estrategias, escolhidas pelo que os criterios permitem (§8.4):
+
+    - ha criterio EXATO -> condicao nativa + FindAllBuildCache(Descendants). Um RPC,
+      o provider filtra. E o que torna o poll do uia_wait_for (Task 11) barato o
+      bastante para o CA-11.
+    - so criterios de cliente (contains/starts_with/regex/text_contains) -> a
+      condicao seria TrueCondition, e FindAll com TrueCondition enumera a janela
+      inteira antes de devolver (24409 nos / ~18 s no WhatsApp Desktop, medido).
+      Nesse ramo a busca vira varredura por nivel com teto de visita, que freia
+      DURANTE a descida e para assim que junta max_results.
+    """
+    from .refs import ElementIdentity
+    from .uia import search as busca
+    from .uia.core import automation, control_type_name, pattern_availability_props
+    from .uia.filters import passa_no_filtro
+    from .uia.nodes import _cached, build_node
+    from .uia.search import casa_no_cliente
+    from .uia.tree import _patterns_disponiveis
+
+    inicio = time.perf_counter()
+    criterios.validar()
+
+    janela = resolver_janela(ctx, window_ref)
+    a = automation()
+    versao = ctx.refs.tree_version(window_ref)
+    props_de_pattern = pattern_availability_props()
+    teto = busca.TETO_DE_BUSCA
+
+    def _no_de(elem: Any) -> dict[str, Any] | None:
+        """Serializa e aplica os filtros de cliente. None = nao e um match."""
+        node = build_node(
+            elem, ref="", depth=0,
+            patterns=_patterns_disponiveis(elem, props_de_pattern),
+        )
+        if only_interactive and not passa_no_filtro(node, "interactive"):
+            return None
+        if not casa_no_cliente(node, criterios):
+            return None
+        return node
+
+    condicao, restringe = a.condicao_de_criterios(criterios)
+    pares: list[tuple[Any, dict[str, Any]]] = []
+
+    if restringe:
+        bruto = a.buscar_plano(janela.hwnd, condicao, teto=teto)
+        parou_cedo = False
+        for i, elem in enumerate(bruto.elementos):
+            node = _no_de(elem)
+            if node is None:
+                continue
+            pares.append((elem, node))
+            if len(pares) >= max_results:
+                parou_cedo = i + 1 < len(bruto.elementos)
+                break
+        exaustiva = bruto.exhaustive and not parou_cedo
+    else:
+        # Mesmo truque de tree.capturar_janela: `percorrer` chama o predicado uma vez
+        # por no e faz append em `emitidos` na mesma ordem quando ele diz True, entao
+        # aceitos[i] corresponde a bruto.elementos[i] — sem mapa por id() de ponteiro.
+        aceitos: list[dict[str, Any]] = []
+
+        def _predicado(elem: Any) -> bool:
+            node = _no_de(elem)
+            if node is None:
+                return False
+            aceitos.append(node)
+            return True
+
+        bruto = a.varrer_descendentes(
+            janela.hwnd, aceita=_predicado, max_resultados=max_results, teto=teto
+        )
+        pares = list(zip(bruto.elementos, aceitos, strict=True))
+        exaustiva = bruto.exhaustive
+
+    achados: list[dict[str, Any]] = []
+    for elem, node in pares:
+        node["ref"] = ctx.refs.put(
+            elem,
+            runtime_id=a.runtime_id_of(elem),
+            hwnd=janela.hwnd,
+            window_ref=window_ref,
+            identity=ElementIdentity(
+                automation_id=_cached(elem, "CachedAutomationId", "") or "",
+                control_type=control_type_name(_cached(elem, "CachedControlType", 0)),
+                name=_cached(elem, "CachedName", "") or "",
+                class_name=_cached(elem, "CachedClassName", "") or "",
+            ),
+            tree_version=versao,
+        )
+        node["path"] = _trilha_ancestral(a, elem, proprio=node["type"])
+        # `d` e profundidade de captura de arvore; numa busca plana nao diz nada.
+        node.pop("d", None)
+        achados.append(node)
+
+    duracao = (time.perf_counter() - inicio) * 1000
+
+    if not achados:
+        ctx.audit.log_call(
+            tool="uia_find_elements", result="not_found",
+            params={"window_ref": window_ref}, duration_ms=duracao,
+            target={"process": janela.process, "pid": janela.pid},
+            read_only=ctx.policy.read_only,
+        )
+        raise ToolError(
+            Code.ELEMENT_NOT_FOUND,
+            "No element matched the given criteria in this window.",
+            window_ref=window_ref,
+            visited=bruto.visitados,
+            exhaustive=exaustiva,
+        )
+
+    ctx.audit.log_call(
+        tool="uia_find_elements", result="ok",
+        params={"window_ref": window_ref, "max_results": max_results,
+                "only_interactive": only_interactive},
+        target={"process": janela.process, "pid": janela.pid},
+        duration_ms=duracao, read_only=ctx.policy.read_only,
+    )
+
+    return {
+        "ok": True,
+        "window_ref": window_ref,
+        "matches": achados,
+        "stats": {
+            "returned": len(achados),
+            # No ramo nativo isto e o numero de candidatos que o provider devolveu,
+            # nao de nos que ele varreu — quem varreu foi ele, e nao conta.
+            "visited": bruto.visitados,
+            "exhaustive": exaustiva,
+        },
+    }
+
+
+@mcp.tool()
+@tool_errors
+async def uia_find_elements(
+    window_ref: Annotated[str, Field(description="Window ref from uia_list_windows.")],
+    name: Annotated[str | None, Field(description="Matched according to `match`.")] = None,
+    automation_id: Annotated[str | None, Field(description="Exact, case-sensitive.")] = None,
+    control_type: Annotated[str | None, Field(description="Button, Edit, MenuItem, …")] = None,
+    class_name: Annotated[str | None, Field(description="Exact.")] = None,
+    text_contains: Annotated[str | None, Field(description="Substring of name or value.")] = None,
+    match: Annotated[str, Field(description="exact | contains | starts_with | regex")] = "contains",
+    only_interactive: Annotated[bool, Field()] = True,
+    max_results: Annotated[int, Field(ge=1, le=100)] = 20,
+) -> dict[str, Any]:
+    """Search a window for elements matching a criterion (name, automation id, control type,
+    partial text) and return candidate refs. Cheaper and more precise than dumping the tree
+    when you already know what you are looking for. An exact automation_id, class_name,
+    control_type or name (match='exact') is resolved by the provider and covers the whole
+    window; with only contains/starts_with/regex/text_contains the search is capped, and
+    stats.exhaustive comes back false when it had to stop early."""
+    ctx = context()
+    criterios = Criterios(
+        name=name, automation_id=automation_id, control_type=control_type,
+        class_name=class_name, text_contains=text_contains, match=match,
+    )
+    return await ctx.worker.run(
+        lambda: find_elements_impl(
+            ctx, window_ref=window_ref, criterios=criterios,
+            only_interactive=only_interactive, max_results=max_results,
         )
     )

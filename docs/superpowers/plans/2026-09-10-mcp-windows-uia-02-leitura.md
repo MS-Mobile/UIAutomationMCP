@@ -2192,88 +2192,112 @@ git commit -m "feat(server): tool uia_get_tree com paginacao por cursor, cobre C
 ### Task 8: Tool `uia_find_elements` (§8.4)
 
 **Files:**
+- Modify: `src/mcp_windows_uia/uia/search.py`
+- Modify: `src/mcp_windows_uia/uia/core.py`
 - Modify: `src/mcp_windows_uia/server.py`
 - Test: `tests/e2e/test_tool_find_elements.py`
 
-- [ ] **Step 1: Escrever o teste e2e que falha**
+**Decisão desta task — a busca sem critério nativo.** O rascunho original mandava
+`FindAllBuildCache(TreeScope_Descendants, condicao, cr)` sempre, com `teto=5000` na
+materialização. Isso não freia nada quando `condicao_de_criterios` devolve
+`TrueCondition` (só `contains`/`starts_with`/`regex`/`text_contains` informados): o
+`FindAll` **enumera a janela inteira antes de devolver** — 24409 nós e ~18 s medidos no
+WhatsApp Desktop — e um teto aplicado depois já pagou o custo todo. Sabotagem que
+comprova: forçar o ramo nativo com teto 2 no Bloco de Notas devolve `visited=45`, ou
+seja, o teto não cortou coisa alguma.
 
-`tests/e2e/test_tool_find_elements.py`:
+Então a §8.4 passa a ter **duas estratégias**, escolhidas pelo que os critérios
+permitem:
 
-```python
-"""uia_find_elements contra janela real. Cobre CA-24."""
+| Critérios | Estratégia | Custo |
+|---|---|---|
+| ao menos um EXATO (`automation_id`, `class_name`, `control_type`, `name`+`match="exact"`) | condição nativa + `FindAllBuildCache(Descendants)` | 1 RPC, provider filtra, cobre a janela inteira |
+| só filtros de cliente | varredura por nível com teto de visita (reusa `percorrer` da §5.2) | freia DURANTE a descida e para ao juntar `max_results` |
 
-from __future__ import annotations
+É exatamente o que a §8.4 da spec já pedia em texto ("nesse caso a busca respeita
+`max_depth=40` e um teto interno de 5000 nós visitados; estourou → resultado parcial com
+`"exhaustive": false`") — o rascunho é que não tinha traduzido isso em código.
 
-import pytest
+`stats.exhaustive` é honesto nos dois ramos: só é `true` quando **todo** o espaço de
+busca foi olhado. Fica `false` se o teto estourou, se a profundidade cortou, se irmãos
+foram elididos, ou se paramos em `max_results` com candidatos por examinar.
 
-from tests.e2e.test_tool_get_tree import notepad, servidor  # noqa: F401
+- [x] **Step 1: Escrever os testes e2e que falham**
 
-pytestmark = pytest.mark.e2e
+`tests/e2e/test_tool_find_elements.py` — reaproveita `servidor` e `notepad` de
+`test_tool_get_tree` (não abre um segundo Bloco de Notas). Sete testes:
 
+| Teste | O que trava |
+|---|---|
+| `test_acha_por_control_type` | ramo nativo devolve só `Button` |
+| `test_matches_trazem_path_para_desambiguar` | todo match tem `path`, terminado no próprio tipo |
+| `test_ca24_homonimos_sao_distinguiveis_pelo_path` | **CA-24**: homônimos voltam todos, com `path` distinto |
+| `test_zero_matches_e_erro_com_hint` | zero é `ELEMENT_NOT_FOUND` com hint citando `uia_get_tree` |
+| `test_sem_criterio_algum_e_invalid_argument` | `Criterios.validar()` |
+| `test_exhaustive_verdadeiro_quando_a_busca_cobre_tudo` | ramo nativo em janela pequena → `true` |
+| `test_exhaustive_e_honesto_quando_o_teto_estoura` | `TETO_DE_BUSCA` rebaixado por monkeypatch → `false` |
 
-async def test_acha_por_control_type(servidor, notepad) -> None:  # noqa: F811
-    from mcp_windows_uia.server import uia_find_elements
+Dois detalhes que só aparecem contra a janela real:
 
-    wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    r = await uia_find_elements(window_ref=wref, control_type="Edit")
+- O alvo é `control_type="Button"`, **não** `"Edit"`. O Bloco de Notas do Windows 11 não
+  tem nenhum ControlType `Edit`: a área de texto é um `Document` (`RichEditD2DPT`) dentro
+  de um `Pane` `NotepadTextBox`. Medido: 17 Buttons, zero Edits. O teste do rascunho
+  falharia com `ELEMENT_NOT_FOUND` para sempre.
+- O par homônimo do CA-24 vem dos `Pane` de nome vazio (8 deles, 4 `path` distintos).
+  Usar `name="Sistema"` seria depender do idioma da instalação.
 
-    assert r["ok"] is True
-    assert len(r["matches"]) >= 1
-    assert all(m["type"] == "Edit" for m in r["matches"])
-
-
-async def test_matches_trazem_path_para_desambiguar(servidor, notepad) -> None:  # noqa: F811
-    """Spec §8.4: path evita uma chamada extra so para o agente escolher."""
-    from mcp_windows_uia.server import uia_find_elements
-
-    wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    r = await uia_find_elements(window_ref=wref, control_type="Edit")
-
-    assert all("path" in m for m in r["matches"])
-
-
-async def test_zero_matches_e_erro_com_hint(servidor, notepad) -> None:  # noqa: F811
-    """Spec §8.4: zero resultados e ELEMENT_NOT_FOUND, nao lista vazia."""
-    from mcp_windows_uia.server import uia_find_elements
-
-    wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    r = await uia_find_elements(window_ref=wref, name="botao-que-nao-existe-xyz")
-
-    assert r["ok"] is False
-    assert r["error"]["code"] == "ELEMENT_NOT_FOUND"
-    assert "uia_get_tree" in r["error"]["hint"]
-
-
-async def test_sem_criterio_algum_e_invalid_argument(servidor, notepad) -> None:  # noqa: F811
-    from mcp_windows_uia.server import uia_find_elements
-
-    wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    r = await uia_find_elements(window_ref=wref)
-
-    assert r["ok"] is False
-    assert r["error"]["code"] == "INVALID_ARGUMENT"
-```
-
-- [ ] **Step 2: Rodar e confirmar que falha**
+- [x] **Step 2: Rodar e confirmar que falha**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/e2e/test_tool_find_elements.py -q`
-Expected: FAIL — `ImportError: cannot import name 'uia_find_elements'`
+Expected: FAIL — `ImportError: cannot import name 'uia_find_elements'` (7 failed)
 
-- [ ] **Step 3: Implementar a busca plana nativa em `uia/core.py`**
-
-Este e o metodo que a §8.4 pede e que o `uia_wait_for` (Task 11) e o rebind (Task 12)
-tambem usam. Sem ele, cada poll do wait_for custaria uma captura de arvore inteira —
-o CA-11 exige `polls > 5` em 1500 ms e nao sobreviveria a isso.
-
-Acrescentar a classe `Automation` em `src/mcp_windows_uia/uia/core.py`:
+- [x] **Step 3: Teto de busca em `uia/search.py`**
 
 ```python
-    def condicao_de_criterios(self, criterios: Any) -> Any:
+# Teto interno de elementos olhados numa busca (spec §8.4). Mesmo espirito do
+# `max_visited` da §5.2: sem ele, uma busca sem criterio nativo enumera a janela
+# inteira — 24409 nos e ~18 s no WhatsApp Desktop. Estourar o teto nao e erro; e
+# resultado parcial com `stats.exhaustive` = false.
+TETO_DE_BUSCA = 5000
+```
+
+Fica em `search.py` (módulo puro) e é lido **em tempo de chamada** por
+`find_elements_impl`, para que o teste possa rebaixá-lo por monkeypatch.
+
+- [x] **Step 4: As duas estratégias em `uia/core.py`**
+
+Imports novos no topo: `Callable`, `dataclass`, `from ..budget import
+HARD_MAX_CHILDREN, HARD_MAX_DEPTH`, `from .search import TETO_DE_BUSCA`.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Achados:
+    """Resultado bruto de uma busca da §8.4.
+
+    `exhaustive` e o compromisso honesto com o agente: False significa "sobrou
+    janela que eu nao olhei", e ai um zero-match nao prova ausencia.
+    """
+
+    elementos: list[Any]
+    visitados: int
+    exhaustive: bool
+```
+
+Na classe `Automation`:
+
+```python
+    def condicao_de_criterios(self, criterios: Any) -> tuple[Any, bool]:
         """Traduz o que da para condicao nativa. Spec §8.4.
 
         So criterios EXATOS viram condicao — o provider filtra do lado dele, o que e
         muito mais barato que trazer a arvore. contains/starts_with/regex e
         text_contains ficam para o filtro no cliente.
+
+        Devolve `(condicao, restringe)`. O segundo item existe porque a diferenca
+        entre "condicao que poda" e TrueCondition e a diferenca entre um RPC e
+        enumerar a janela inteira: quem chama precisa escolher a estrategia a partir
+        dela. E ele nao pode ser deduzido so olhando os criterios — um
+        `control_type` que nao existe no typelib nao vira condicao nenhuma.
         """
         U = self.UIA
         condicoes: list[Any] = []
@@ -2288,8 +2312,11 @@ Acrescentar a classe `Automation` em `src/mcp_windows_uia/uia/core.py`:
             )
         if criterios.control_type:
             tipo_id = next(
-                (cid for cid, nome in control_type_names().items()
-                 if nome == criterios.control_type),
+                (
+                    cid
+                    for cid, nome in control_type_names().items()
+                    if nome == criterios.control_type
+                ),
                 None,
             )
             if tipo_id is not None:
@@ -2297,50 +2324,97 @@ Acrescentar a classe `Automation` em `src/mcp_windows_uia/uia/core.py`:
         if criterios.name and criterios.match == "exact":
             condicoes.append(self.property_condition(U.UIA_NamePropertyId, criterios.name))
 
-        return self.and_conditions(*condicoes)
+        return self.and_conditions(*condicoes), bool(condicoes)
 
-    def buscar_plano(self, hwnd: int, condicao: Any, *, teto: int = 5000) -> list[Any]:
+    def buscar_plano(self, hwnd: int, condicao: Any, *, teto: int = TETO_DE_BUSCA) -> Achados:
         """FindAll cacheado dentro de uma janela. Busca PLANA — nao atravessa nada.
 
         Diferente do percurso da §5.2, aqui a condicao nativa e legitima: nao ha
         travessia a podar. Um unico RPC traz todos os candidatos ja com propriedades.
+
+        Exige uma condicao que RESTRINJA. Com TrueCondition o FindAll enumera todos
+        os descendentes antes de devolver e o `teto` nao economiza nada — o custo ja
+        foi pago. Esse caso e de `varrer_descendentes`.
         """
         cr = self.build_cache_request(self.tree_props())
         raiz = self.element_from_handle(hwnd)
-        try:
-            achados = raiz.FindAllBuildCache(self.UIA.TreeScope_Descendants, condicao, cr)
-        except Exception:
-            return []
-        return [achados.GetElement(i) for i in range(min(achados.Length, teto))]
+        # Sem try/except: um FindAll que falha num app travado precisa aflorar como
+        # TIMEOUT/UIA_COM_ERROR (o UiaWorker converte), nao virar "nao encontrei".
+        achados = raiz.FindAllBuildCache(self.UIA.TreeScope_Descendants, condicao, cr)
+        total = achados.Length
+        return Achados(
+            elementos=[achados.GetElement(i) for i in range(min(total, teto))],
+            visitados=total,
+            exhaustive=total <= teto,
+        )
+
+    def varrer_descendentes(
+        self,
+        hwnd: int,
+        *,
+        aceita: Callable[[Any], bool],
+        max_resultados: int,
+        teto: int = TETO_DE_BUSCA,
+        max_depth: int = HARD_MAX_DEPTH,
+    ) -> Achados:
+        """Varredura por nivel com teto de visita. Ramo sem criterio nativo da §8.4.
+
+        Reusa o `percorrer` da §5.2 de proposito: o freio precisa ser aplicado
+        DURANTE a descida. E tambem para assim que junta `max_resultados`, entao o
+        caso comum (o alvo esta nos primeiros niveis) custa uma fracao da janela.
+        """
+        from .tree import CaptureBudget, filhos_cacheados, percorrer
+
+        cr = self.build_cache_request(self.tree_props())
+        raiz = self.element_from_handle_build_cache(hwnd, cr)
+        r = percorrer(
+            raiz,
+            filhos_cacheados(self, cr),
+            lambda elem, _nivel: aceita(elem),
+            CaptureBudget(
+                max_nodes=max_resultados,
+                max_depth=max_depth,
+                max_children_per_node=HARD_MAX_CHILDREN,
+                max_visited=teto,
+                depth_is_default=False,
+            ),
+        )
+        return Achados(
+            elementos=[elem for elem, _nivel in r.emitidos],
+            visitados=r.visitados,
+            # Irmaos elididos tambem sao janela nao olhada — nao da para dizer que
+            # a busca foi exaustiva tendo cortado filhos.
+            exhaustive=not r.truncado and not r.elididos,
+        )
 ```
 
-- [ ] **Step 4: Implementar `uia_find_elements` em `server.py`**
+- [x] **Step 5: Implementar `uia_find_elements` em `server.py`**
 
-Acrescentar ao fim de `server.py`:
+Import novo no topo: `from .uia.search import Criterios`.
+
+`_trilha_ancestral` difere do rascunho em dois pontos, ambos para bater com o exemplo
+da §8.4 (`"Window > Pane > CommandBar > Button"`): a trilha **inclui o próprio
+elemento** no fim, e **para no elemento raiz do desktop** (senão todo `path` ganharia
+um `Pane[Área de Trabalho]` na frente, que não distingue nada). Custo medido no Bloco
+de Notas: ~5 ms por elemento.
 
 ```python
-# --------------------------------------------------------------------------- 8.4
-
-
-def _trilha_ancestral(automation: Any, elem: Any, *, niveis: int = 5) -> str:
-    """Trilha legivel dos ancestrais, max 5 niveis (spec §8.4).
-
-    Sobe pelo ControlViewWalker. Custa ate 5 RPCs por match, o que so vale porque
-    max_results e pequeno — e evita uma segunda chamada do agente so para
-    desambiguar dois botoes de mesmo nome (CA-24).
-    """
+def _trilha_ancestral(automation: Any, elem: Any, *, proprio: str, niveis: int = 5) -> str:
     from .uia.core import control_type_name
 
-    trilha: list[str] = []
+    trilha: list[str] = [proprio]
     atual = elem
     for _ in range(niveis):
         try:
             pai = automation.control_walker.GetParentElement(atual)
         except Exception:
             break
+        # Ponteiro COM pode ser NULL e falsy: testar antes de desreferenciar.
         if not pai:
             break
         try:
+            if automation.iuia.CompareElements(pai, automation.root):
+                break
             rotulo = control_type_name(pai.CurrentControlType)
             nome = pai.CurrentName or ""
         except Exception:
@@ -2348,147 +2422,82 @@ def _trilha_ancestral(automation: Any, elem: Any, *, niveis: int = 5) -> str:
         trilha.append(f"{rotulo}[{nome}]" if nome else rotulo)
         atual = pai
     return " > ".join(reversed(trilha))
-
-
-def find_elements_impl(
-    ctx: ServerContext,
-    *,
-    window_ref: str,
-    criterios: "Criterios",
-    only_interactive: bool,
-    max_results: int,
-) -> dict[str, Any]:
-    """Corpo sincrono de uia_find_elements. Roda na thread do worker."""
-    from .uia.filters import passa_no_filtro
-    from .uia.search import casa_no_cliente
-
-    from .refs import ElementIdentity
-    from .uia.core import automation, control_type_name, pattern_availability_props
-    from .uia.nodes import _cached, build_node
-    from .uia.tree import _patterns_disponiveis
-
-    inicio = time.perf_counter()
-    criterios.validar()
-
-    janela = resolver_janela(ctx, window_ref)
-    a = automation()
-    versao = ctx.refs.tree_version(window_ref)
-    props_de_pattern = pattern_availability_props()
-
-    # Busca PLANA com condicao nativa (§8.4). Um RPC, nao uma travessia — e o que
-    # torna o poll do uia_wait_for barato o bastante para o CA-11.
-    candidatos = a.buscar_plano(janela.hwnd, a.condicao_de_criterios(criterios))
-
-    achados: list[dict[str, Any]] = []
-    for elem in candidatos:
-        node = build_node(
-            elem, ref="", depth=0,
-            patterns=_patterns_disponiveis(elem, props_de_pattern),
-        )
-        if only_interactive and not passa_no_filtro(node, "interactive"):
-            continue
-        if not casa_no_cliente(node, criterios):
-            continue
-
-        node["ref"] = ctx.refs.put(
-            elem,
-            runtime_id=a.runtime_id_of(elem),
-            hwnd=janela.hwnd,
-            window_ref=window_ref,
-            identity=ElementIdentity(
-                automation_id=_cached(elem, "CachedAutomationId", "") or "",
-                control_type=control_type_name(_cached(elem, "CachedControlType", 0)),
-                name=_cached(elem, "CachedName", "") or "",
-                class_name=_cached(elem, "CachedClassName", "") or "",
-            ),
-            tree_version=versao,
-        )
-        node["path"] = _trilha_ancestral(a, elem)
-        node.pop("d", None)
-        achados.append(node)
-        if len(achados) >= max_results:
-            break
-
-    duracao = (time.perf_counter() - inicio) * 1000
-
-    if not achados:
-        ctx.audit.log_call(
-            tool="uia_find_elements", result="not_found",
-            params={"window_ref": window_ref}, duration_ms=duracao,
-            read_only=ctx.policy.read_only,
-        )
-        raise ToolError(
-            Code.ELEMENT_NOT_FOUND,
-            "No element matched the given criteria in this window.",
-            window_ref=window_ref,
-            visited=len(candidatos),
-        )
-
-    ctx.audit.log_call(
-        tool="uia_find_elements", result="ok",
-        params={"window_ref": window_ref, "matches": len(achados)},
-        duration_ms=duracao, read_only=ctx.policy.read_only,
-    )
-
-    return {
-        "ok": True,
-        "window_ref": window_ref,
-        "matches": achados,
-        "stats": {
-            "returned": len(achados),
-            "visited": len(candidatos),
-            "exhaustive": len(candidatos) < 5000,
-        },
-    }
-
-
-@mcp.tool()
-@tool_errors
-async def uia_find_elements(
-    window_ref: Annotated[str, Field(description="Window ref from uia_list_windows.")],
-    name: Annotated[str | None, Field(description="Matched according to `match`.")] = None,
-    automation_id: Annotated[str | None, Field(description="Exact, case-sensitive.")] = None,
-    control_type: Annotated[str | None, Field(description="Button, Edit, MenuItem, …")] = None,
-    class_name: Annotated[str | None, Field(description="Exact.")] = None,
-    text_contains: Annotated[str | None, Field(description="Substring of name or value.")] = None,
-    match: Annotated[str, Field(description="exact | contains | starts_with | regex")] = "contains",
-    only_interactive: Annotated[bool, Field()] = True,
-    max_results: Annotated[int, Field(ge=1, le=100)] = 20,
-) -> dict[str, Any]:
-    """Search a window for elements matching a criterion (name, automation id, control type,
-    partial text) and return candidate refs. Cheaper and more precise than dumping the tree
-    when you already know what you are looking for."""
-    from .uia.search import Criterios
-
-    ctx = context()
-    criterios = Criterios(
-        name=name, automation_id=automation_id, control_type=control_type,
-        class_name=class_name, text_contains=text_contains, match=match,
-    )
-    return await ctx.worker.run(
-        lambda: find_elements_impl(
-            ctx, window_ref=window_ref, criterios=criterios,
-            only_interactive=only_interactive, max_results=max_results,
-        )
-    )
 ```
 
-Acrescentar ao topo do arquivo, junto aos outros imports:
+`find_elements_impl` escolhe a estratégia e, no ramo de varredura, usa o mesmo truque
+de `tree.capturar_janela` para casar elemento e nó já serializado (`percorrer` chama o
+predicado uma vez por nó e faz `append` em `emitidos` na mesma ordem quando ele diz
+`True`) — nada de mapa por `id()` de ponteiro COM:
 
 ```python
-from .uia.search import Criterios
+    condicao, restringe = a.condicao_de_criterios(criterios)
+    pares: list[tuple[Any, dict[str, Any]]] = []
+
+    if restringe:
+        bruto = a.buscar_plano(janela.hwnd, condicao, teto=teto)
+        parou_cedo = False
+        for i, elem in enumerate(bruto.elementos):
+            node = _no_de(elem)
+            if node is None:
+                continue
+            pares.append((elem, node))
+            if len(pares) >= max_results:
+                parou_cedo = i + 1 < len(bruto.elementos)
+                break
+        exaustiva = bruto.exhaustive and not parou_cedo
+    else:
+        aceitos: list[dict[str, Any]] = []
+
+        def _predicado(elem: Any) -> bool:
+            node = _no_de(elem)
+            if node is None:
+                return False
+            aceitos.append(node)
+            return True
+
+        bruto = a.varrer_descendentes(
+            janela.hwnd, aceita=_predicado, max_resultados=max_results, teto=teto
+        )
+        pares = list(zip(bruto.elementos, aceitos, strict=True))
+        exaustiva = bruto.exhaustive
 ```
 
-- [ ] **Step 5: Rodar os testes e2e**
+O resto segue o rascunho: `ctx.refs.put` por match, `node["path"]`, `node.pop("d")`
+(profundidade não quer dizer nada numa busca plana), `ELEMENT_NOT_FOUND` sem `hint`
+próprio — o default da §9 já é o texto exato que a §8.4 pede. A auditoria de sucesso e
+a de `not_found` carregam `target={process, pid}`, como nas outras tools.
+
+`stats.visited` no ramo nativo é o número de candidatos que o provider devolveu, não de
+nós que ele varreu: quem varreu foi ele, e não conta.
+
+- [x] **Step 6: Rodar os testes e2e**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/e2e/test_tool_find_elements.py -q`
-Expected: PASS — 4 passed
+Expected: PASS — 7 passed
 
-- [ ] **Step 6: Commit**
+Sabotagens feitas para provar que os testes têm dentes (todas revertidas):
+
+| Sabotagem | Quebra |
+|---|---|
+| `_trilha_ancestral` sem ancestrais | `test_ca24_homonimos...` (`paths` todos `Pane`) |
+| `restringe = True` sempre | `test_exhaustive_e_honesto...` (`visited=45` com teto 2) |
+| `exaustiva = True` no ramo de varredura | `test_exhaustive_e_honesto...` |
+| sem `criterios.validar()` | `test_sem_criterio_algum...` |
+| zero matches devolve lista vazia | `test_zero_matches_e_erro_com_hint` |
+| sem `casa_no_cliente` | `test_zero_matches...` (o "botão que não existe" casa com tudo) |
+| `node["path"] = ""` | `test_matches_trazem_path...` e `test_ca24...` |
+| `exaustiva = False` no ramo nativo | `test_exhaustive_verdadeiro...` |
+
+- [x] **Step 7: Verificar que a tool aparece no `tools/list`**
+
+Run: `.venv/Scripts/python.exe -c "from mcp_windows_uia.server import mcp; import asyncio; print([t.name for t in asyncio.run(mcp.list_tools())])"`
+Expected: `['uia_list_windows', 'uia_get_tree', 'uia_find_elements']`
+
+- [x] **Step 8: Commit**
 
 ```bash
-git add src/mcp_windows_uia/uia/core.py src/mcp_windows_uia/server.py tests/e2e/test_tool_find_elements.py
-git commit -m "feat(server): tool uia_find_elements com path de desambiguacao"
+git add -A
+git commit -m "feat(server): tool uia_find_elements com busca plana nativa, cobre CA-24"
 ```
 
 ---

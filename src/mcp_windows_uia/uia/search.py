@@ -16,6 +16,12 @@ from ..errors import Code, ToolError
 
 MATCHES = ("exact", "contains", "starts_with", "regex")
 
+# Teto interno de elementos olhados numa busca (spec §8.4). Mesmo espirito do
+# `max_visited` da §5.2: sem ele, uma busca sem criterio nativo enumera a janela
+# inteira — 24409 nos e ~18 s no WhatsApp Desktop. Estourar o teto nao e erro; e
+# resultado parcial com `stats.exhaustive` = false.
+TETO_DE_BUSCA = 5000
+
 
 @dataclass(frozen=True, slots=True)
 class Criterios:
