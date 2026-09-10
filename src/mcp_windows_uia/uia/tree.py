@@ -111,6 +111,19 @@ def percorrer(
     return r
 
 
+def orcamento_de_pagina(pular: int, max_nodes: int) -> tuple[int, int]:
+    """(pular normalizado, teto de emissao da travessia) para uma pagina. Spec §5.2.
+
+    O TAMANHO da pagina devolvida e limitado por HARD_MAX_NODES (CA-09), mas o teto
+    de travessia soma `pular`: se ele tambem parasse em 1500, nunca daria para
+    paginar alem do no 1500 — que e justamente onde a paginacao importa (o WhatsApp
+    Desktop tem ~24 mil nos). O custo do percurso ja tem freio proprio, max_visited.
+    """
+    pular = max(0, int(pular))
+    pagina = clamp(max_nodes, 1, HARD_MAX_NODES)
+    return pular, pular + pagina
+
+
 def _filhos_limitados(
     no: Any,
     nivel: int,
@@ -175,12 +188,21 @@ def capturar_janela(
     max_depth: int | None = None,
     max_children_per_node: int = DEFAULT_MAX_CHILDREN,
     verbose: bool = False,
+    pular: int = 0,
     atribuir_ref: Callable[[Any, int], str] | None = None,
 ) -> dict[str, Any]:
     """Captura a arvore de uma janela dentro do orcamento. Spec §5.2.
 
     `atribuir_ref` e injetado pelo servidor para registrar cada no no RefStore.
     Ausente (uso em teste), gera refs sinteticas.
+
+    `pular` e a continuacao por cursor: percorre com orcamento `pular + pagina` e
+    fatia `[pular:]` no FIM. Descartar dentro do filtro seria mais barato, mas
+    deixaria `emitidos` vazio no comeco da pagina 2 e ligaria o aprofundamento
+    adaptativo da §6.1 ("nada passou no filtro") — cada pagina desceria a uma
+    profundidade diferente, com sobreposicao ou buracos entre elas. Aqui a forma da
+    travessia e identica em toda pagina, que e o que o CA-08 exige (intersecao de
+    `ref` vazia entre paginas consecutivas).
     """
     from . import core
     from .filters import passa_no_filtro
@@ -222,8 +244,9 @@ def capturar_janela(
         aprovados.append(node)
         return True
 
+    pular, teto_de_emissao = orcamento_de_pagina(pular, max_nodes)
     orcamento = CaptureBudget(
-        max_nodes=clamp(max_nodes, 1, HARD_MAX_NODES),
+        max_nodes=teto_de_emissao,
         max_depth=DEFAULT_MAX_DEPTH if max_depth is None else max_depth,
         max_children_per_node=max_children_per_node,
         depth_is_default=max_depth is None,
@@ -237,6 +260,9 @@ def capturar_janela(
         if elididos:
             node["n"] = elididos
         nodes.append(node)
+
+    # A fatia e o ULTIMO passo: ate aqui a travessia foi identica a da pagina 1.
+    nodes = nodes[pular:]
 
     stats: dict[str, Any] = {
         "returned": len(nodes),

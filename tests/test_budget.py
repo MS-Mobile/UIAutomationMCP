@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
+import string
+
 import pytest
 
 from mcp_windows_uia.budget import (
+    CURSOR_TTL_S,
     HARD_MAX_NODES,
     Limits,
     clamp,
@@ -72,3 +76,50 @@ def test_cursor_corrompido_vira_invalid_argument() -> None:
     with pytest.raises(ToolError) as exc:
         decode_cursor("nao-e-base64-valido!!", now=1000.0)
     assert exc.value.code is Code.INVALID_ARGUMENT
+
+
+def test_cursor_nao_vaza_o_window_ref_em_claro() -> None:
+    """Opaco de verdade: o agente nao deve ler nem fabricar o conteudo."""
+    c = encode_cursor("w3", tree_version=7, position=200, now=1000.0)
+    assert "w3" not in c
+    assert "tree_version" not in c and "position" not in c
+
+
+def test_cursor_e_base64_url_safe_sem_padding() -> None:
+    """Sem '=' nem '+/' — vai em JSON e em URL sem escapar; decode repoe o padding."""
+    c = encode_cursor("w" * 13, tree_version=7, position=200, now=1000.0)
+    assert "=" not in c
+    assert set(c) <= set(string.ascii_letters + string.digits + "-_")
+    assert decode_cursor(c, now=1000.0) == ("w" * 13, 7, 200)
+
+
+def test_cursor_vazio_e_rejeitado_como_invalido() -> None:
+    with pytest.raises(ToolError) as exc:
+        decode_cursor("", now=1000.0)
+    assert exc.value.code is Code.INVALID_ARGUMENT
+
+
+def test_cursor_com_json_valido_mas_sem_as_chaves_e_rejeitado() -> None:
+    """Base64 legitimo de um JSON alheio nao pode virar posicao 0 silenciosamente."""
+    forjado = base64.urlsafe_b64encode(b'{"x":1}').decode("ascii").rstrip("=")
+    with pytest.raises(ToolError) as exc:
+        decode_cursor(forjado, now=1000.0)
+    assert exc.value.code is Code.INVALID_ARGUMENT
+
+
+def test_cursor_invalido_traz_hint_mandando_repetir_sem_cursor() -> None:
+    """Erro e instrucao (§9): o agente tem de saber que a saida e largar o cursor."""
+    for ruim in ("nao-e-base64!!", "", base64.urlsafe_b64encode(b"[]").decode()):
+        with pytest.raises(ToolError) as exc:
+            decode_cursor(ruim, now=1000.0)
+        assert "cursor" in exc.value.hint.lower()
+
+    expirado = encode_cursor("w3", tree_version=7, position=200, now=1000.0)
+    with pytest.raises(ToolError) as exc:
+        decode_cursor(expirado, now=1000.0 + 121.0)
+    assert "cursor" in exc.value.hint.lower()
+
+
+def test_cursor_no_limite_exato_do_ttl_ainda_vale() -> None:
+    c = encode_cursor("w3", tree_version=7, position=200, now=1000.0)
+    assert decode_cursor(c, now=1000.0 + CURSOR_TTL_S) == ("w3", 7, 200)

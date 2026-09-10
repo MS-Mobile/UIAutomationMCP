@@ -22,9 +22,10 @@ from typing import Annotated, Any
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
+from .budget import decode_cursor, encode_cursor
 from .context import ServerContext, context
 from .errors import Code, ToolError
-from .uia.windows import enumerate_windows, server_is_elevated
+from .uia.windows import WindowInfo, enumerate_windows, server_is_elevated, window_is_alive
 
 _log = logging.getLogger(__name__)
 
@@ -47,6 +48,40 @@ def tool_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
             ).to_dict()
 
     return wrapper
+
+
+def resolver_janela(ctx: ServerContext, window_ref: str) -> WindowInfo:
+    """window_ref -> WindowInfo viva, com allowlist ja validada.
+
+    Erros distintos de proposito: ref desconhecida, janela morta e janela negada
+    exigem acoes diferentes do agente.
+    """
+    if not ctx.refs.known_window(window_ref):
+        raise ToolError(
+            Code.WINDOW_NOT_FOUND,
+            f"Window ref {window_ref!r} is not known to this server.",
+            window_ref=window_ref,
+        )
+
+    hwnd = ctx.refs.hwnd_for(window_ref)
+    if not window_is_alive(hwnd):
+        ctx.refs.invalidate_window(window_ref)
+        raise ToolError(
+            Code.WINDOW_CLOSED,
+            f"Window {window_ref} was closed.",
+            window_ref=window_ref,
+        )
+
+    janela = next((w for w in enumerate_windows(include_hidden=True) if w.hwnd == hwnd), None)
+    if janela is None:
+        raise ToolError(
+            Code.WINDOW_CLOSED,
+            f"Window {window_ref} is no longer enumerable.",
+            window_ref=window_ref,
+        )
+
+    ctx.policy.check_window(janela.process, janela.title, window_ref=window_ref)
+    return janela
 
 
 # --------------------------------------------------------------------------- 8.1
@@ -148,5 +183,176 @@ async def uia_list_windows(
             include_hidden=include_hidden,
             process_filter=process_filter,
             max_results=max_results,
+        )
+    )
+
+
+# --------------------------------------------------------------------------- 8.2
+
+
+def _retomar_do_cursor(ctx: ServerContext, window_ref: str, cursor: str) -> tuple[int, int]:
+    """Valida um cursor de continuacao e devolve (tree_version, pular). Spec §5.2.
+
+    O cursor carrega a janela e a versao da arvore justamente para nao continuar
+    uma captura sobre outra coisa: cursor de outra janela, ou de uma versao ja
+    vencida por um uia_get_tree posterior, descreveria posicoes de uma travessia
+    que nao existe mais. Em qualquer um desses casos a saida e a mesma — repetir a
+    chamada SEM cursor —, entao o hint diz isso explicitamente.
+    """
+    # decode_cursor ja levanta INVALID_ARGUMENT para corrompido e para expirado.
+    janela_do_cursor, versao_do_cursor, pular = decode_cursor(cursor)
+
+    versao_atual = ctx.refs.tree_version(window_ref)
+    if janela_do_cursor != window_ref:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            f"This cursor belongs to window {janela_do_cursor!r}, not {window_ref!r}.",
+            hint="Call uia_get_tree again for this window without a cursor.",
+            window_ref=window_ref,
+        )
+    if versao_do_cursor != versao_atual:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            f"This cursor is for tree_version {versao_do_cursor}, "
+            f"but the window is now at {versao_atual}.",
+            hint="The tree was re-captured meanwhile. Call uia_get_tree again without a cursor.",
+            window_ref=window_ref,
+            tree_version=versao_atual,
+        )
+    if pular < 0:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            "This cursor carries a negative position.",
+            hint="Call uia_get_tree again without a cursor.",
+            window_ref=window_ref,
+        )
+    return versao_atual, pular
+
+
+def get_tree_impl(
+    ctx: ServerContext,
+    *,
+    window_ref: str,
+    filtro: str,
+    max_depth: int | None,
+    max_nodes: int,
+    max_children_per_node: int,
+    cursor: str | None,
+    verbose: bool,
+) -> dict[str, Any]:
+    """Corpo sincrono de uia_get_tree. Roda na thread do worker."""
+    from .refs import ElementIdentity
+    from .uia.core import automation, control_type_name
+    from .uia.nodes import _cached
+    from .uia.tree import capturar_janela
+
+    inicio = time.perf_counter()
+    janela = resolver_janela(ctx, window_ref)
+
+    # Com cursor a versao NAO incrementa: ela e o que valida a continuacao. Se cada
+    # pagina bumpasse, a pagina 2 nunca casaria com o cursor emitido pela pagina 1.
+    if cursor is None:
+        versao = ctx.refs.bump_tree_version(window_ref)
+        pular = 0
+    else:
+        versao, pular = _retomar_do_cursor(ctx, window_ref, cursor)
+
+    def registrar(elem: Any, indice: int) -> str:
+        """Registra o elemento no RefStore e devolve a ref estavel.
+
+        Chamado tambem para os nos PULADOS de uma pagina de continuacao. E de
+        proposito: RefStore.put deduplica por (hwnd, runtime_id) e devolve a ref ja
+        existente, entao as refs ficam estaveis entre paginas e o store nao cresce.
+        """
+        return ctx.refs.put(
+            elem,
+            runtime_id=automation().runtime_id_of(elem),
+            hwnd=janela.hwnd,
+            window_ref=window_ref,
+            identity=ElementIdentity(
+                automation_id=_cached(elem, "CachedAutomationId", "") or "",
+                control_type=control_type_name(_cached(elem, "CachedControlType", 0)),
+                name=_cached(elem, "CachedName", "") or "",
+                class_name=_cached(elem, "CachedClassName", "") or "",
+                index_path=(indice,),
+            ),
+            tree_version=versao,
+        )
+
+    capturado = capturar_janela(
+        janela.hwnd,
+        filtro=filtro,
+        max_nodes=max_nodes,
+        max_depth=max_depth,
+        max_children_per_node=max_children_per_node,
+        verbose=verbose,
+        pular=pular,
+        atribuir_ref=registrar,
+    )
+
+    stats = capturado["stats"]
+    # next_cursor so existe quando ha continuacao real.
+    stats["next_cursor"] = (
+        encode_cursor(
+            window_ref, tree_version=versao, position=pular + len(capturado["nodes"])
+        )
+        if stats["truncated"]
+        else None
+    )
+
+    ctx.audit.log_call(
+        tool="uia_get_tree",
+        result="ok",
+        params={"window_ref": window_ref, "filter": filtro, "max_nodes": max_nodes},
+        target={"process": janela.process, "pid": janela.pid},
+        duration_ms=(time.perf_counter() - inicio) * 1000,
+        read_only=ctx.policy.read_only,
+    )
+
+    return {
+        "ok": True,
+        "window_ref": window_ref,
+        "window_title": janela.title,
+        "tree_version": versao,
+        "nodes": capturado["nodes"],
+        "stats": stats,
+    }
+
+
+@mcp.tool()
+@tool_errors
+async def uia_get_tree(
+    window_ref: Annotated[str, Field(description="Window ref from uia_list_windows.")],
+    filter: Annotated[
+        str,
+        Field(description="One of: interactive, content, all, landmarks."),
+    ] = "interactive",
+    max_depth: Annotated[
+        int | None,
+        Field(ge=1, le=40, description="Omit to let the server deepen automatically."),
+    ] = None,
+    max_nodes: Annotated[int, Field(ge=1, le=1500)] = 200,
+    max_children_per_node: Annotated[int, Field(ge=1, le=500)] = 30,
+    cursor: Annotated[
+        str | None,
+        Field(description="Opaque cursor from a previous truncated call."),
+    ] = None,
+    verbose: Annotated[bool, Field(description="Include HelpText/FullDescription.")] = False,
+) -> dict[str, Any]:
+    """Capture the UI Automation tree of a window as a flat, pre-order list of nodes with
+    stable refs. Defaults to interactive elements only. Omit max_depth so the server can
+    go deeper automatically in deeply nested apps such as Electron or WebView2. When
+    stats.truncated is true, pass stats.next_cursor back to continue where it stopped."""
+    ctx = context()
+    return await ctx.worker.run(
+        lambda: get_tree_impl(
+            ctx,
+            window_ref=window_ref,
+            filtro=filter,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            max_children_per_node=max_children_per_node,
+            cursor=cursor,
+            verbose=verbose,
         )
     )

@@ -1813,31 +1813,84 @@ git commit -m "feat(uia): espera por condicao com backoff da spec 7.3"
 ### Task 7: Tool `uia_get_tree` (§8.2)
 
 **Files:**
+- Modify: `src/mcp_windows_uia/budget.py` (codec de cursor)
+- Modify: `src/mcp_windows_uia/uia/tree.py` (parametro `pular`)
 - Modify: `src/mcp_windows_uia/server.py`
-- Test: `tests/e2e/test_tool_get_tree.py`
+- Test: `tests/test_budget.py`, `tests/test_uia_tree.py`, `tests/e2e/test_tool_get_tree.py`
 
-Primeira tool que junta tudo: policy, worker, captura, RefStore.
+Primeira tool que junta tudo: policy, worker, captura, RefStore e paginacao.
 
-- [ ] **Step 1: Escrever o teste e2e que falha**
+**Nota de revisao (2026-09-10):** a versao anterior desta secao fixava
+`stats["next_cursor"] = None` e ao mesmo tempo cobrava o cursor no teste do CA-08 —
+contradicao. O CA-08 exige que a chamada seguinte com o cursor devolva nos
+**diferentes** (intersecao de `ref` vazia), entao a paginacao entra aqui de verdade.
 
-`tests/e2e/test_tool_get_tree.py`:
+- [ ] **Step 1: Codec de cursor em `budget.py` (testes primeiro)**
+
+A §5.2 define o cursor como base64 opaco de `{window_ref, tree_version,
+breadth_position}`, valido por 120 s. O layout de arquivos da spec poe "truncamento,
+paginacao, cursores" em `budget.py`.
+
+Acrescentar a `tests/test_budget.py` (puros, sem COM — o relogio e injetado por
+`now=`, nunca `time.sleep`):
+
+- round-trip: `decode_cursor(encode_cursor("w3", tree_version=7, position=200))` devolve `("w3", 7, 200)`
+- opacidade: a string nao contem `w3` legivel nem os nomes das chaves
+- base64 url-safe sem padding (`=` fora, alfabeto `A-Za-z0-9-_`), e o decode repoe o padding
+- mais de 120 s -> `ToolError(INVALID_ARGUMENT)`; exatamente 120 s ainda vale
+- lixo (`"nao-e-base64!!"`, `""`, base64 de JSON sem as chaves) e rejeitado do mesmo
+  jeito que expirado, sem excecao nao tratada
+- todo hint de cursor invalido manda repetir a chamada **sem** o cursor
+
+Sinalizacao escolhida: `ToolError(Code.INVALID_ARGUMENT)` levantada pelo proprio
+`decode_cursor`. Nao ha codigo de erro especifico para cursor na §9, e o chamador
+distingue "sem cursor" (`cursor is None`) de "cursor ruim" (excecao) sem ambiguidade.
+
+- [ ] **Step 2: Parametro `pular` em `capturar_janela`**
+
+Acrescentar `pular: int = 0` a `capturar_janela` em `uia/tree.py`, e o helper puro:
 
 ```python
-"""uia_get_tree contra janela real. Cobre CA-08 e CA-13."""
+def orcamento_de_pagina(pular: int, max_nodes: int) -> tuple[int, int]:
+    """(pular normalizado, teto de emissao da travessia) para uma pagina."""
+    pular = max(0, int(pular))
+    pagina = clamp(max_nodes, 1, HARD_MAX_NODES)
+    return pular, pular + pagina
+```
 
-from __future__ import annotations
+**Pular DEPOIS da travessia, nao durante** — decisao de projeto, nao detalhe:
+descartar dentro de `_aprovado` deixaria `r.emitidos` vazio no inicio da pagina 2, e o
+aprofundamento adaptativo da §6.1 dispara justamente quando "nada passou no filtro".
+A arvore seria percorrida com **profundidade diferente** entre as paginas, produzindo
+sobreposicao ou buracos — e o CA-08 exige intersecao vazia de `ref` entre paginas.
+Entao: percorre com orcamento de emissao `pular + pagina` e fatia `[pular:]` no fim.
+A forma da travessia fica identica em toda pagina.
 
-import subprocess
-import time
+Cuidado com os tetos: o **tamanho da pagina** devolvida continua limitado por
+`HARD_MAX_NODES` (1500, CA-09), mas o teto interno de travessia precisa poder passar
+de 1500 — senao nunca se pagina alem do no 1500, o que mata a paginacao justamente
+nas arvores grandes que a justificam (WhatsApp Desktop tem ~24 mil nos). O custo de
+travessia ja tem freio proprio, `max_visited`.
 
-import pytest
+`atribuir_ref` e chamado tambem para os nos pulados. E aceitavel: `RefStore.put`
+deduplica por `(hwnd, runtime_id)` e devolve a ref existente, entao as refs ficam
+estaveis entre paginas e o store nao cresce.
 
-pytestmark = pytest.mark.e2e
+Testes em `tests/test_uia_tree.py`, com a arvore falsa que ja existe la:
+`orcamento_de_pagina` normaliza `pular` negativo, limita a pagina a 1500 sem limitar
+a travessia (`(1500, 200) -> (1500, 1700)`), paginas consecutivas sao disjuntas e a
+concatenacao bate com a captura sem paginacao, e a pagina 2 de uma arvore grande
+comeca no no 1500 em vez de parar nele.
 
+- [ ] **Step 3: Escrever o teste e2e que falha**
 
+`tests/e2e/test_tool_get_tree.py`. **Reutiliza** as fixtures `sta` e `bloco_de_notas`
+de `tests/e2e/conftest.py` (escopo de sessao) — nao redefinir um Bloco de Notas
+proprio. A fixture nova e o `ServerContext`:
+
+```python
 @pytest.fixture(scope="module")
-def servidor():
-    """ServerContext com allowlist permitindo o Bloco de Notas."""
+def servidor(sta):
     from mcp_windows_uia.config import (
         AllowlistConfig, AuditConfig, Config, DenylistConfig, KeysConfig, ServerConfig,
     )
@@ -1857,94 +1910,51 @@ def servidor():
     ctx.shutdown()
 
 
-@pytest.fixture(scope="module")
-def notepad(servidor):
-    from mcp_windows_uia.uia.windows import enumerate_windows
-
-    proc = subprocess.Popen(["notepad.exe"])
-    janela = None
-    for _ in range(50):
-        time.sleep(0.2)
-        candidatas = [w for w in enumerate_windows() if w.pid == proc.pid and w.title]
-        if candidatas:
-            janela = candidatas[0]
-            break
-    if janela is None:
-        proc.terminate()
-        pytest.skip("Bloco de Notas nao abriu a tempo")
-    yield janela
-    proc.terminate()
+@pytest.fixture(scope="session")
+def notepad(bloco_de_notas):
+    """Apelido de `bloco_de_notas`, para os modulos e2e das tools seguintes."""
+    return bloco_de_notas
 
 
-async def test_get_tree_devolve_arvore_com_refs(servidor, notepad) -> None:
-    from mcp_windows_uia.server import uia_get_tree
-
-    wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    r = await uia_get_tree(window_ref=wref)
-
-    assert r["ok"] is True
-    assert r["window_ref"] == wref
-    assert len(r["nodes"]) > 0
-    assert "stats" in r
-
-
-async def test_ca08_truncamento_sinaliza_e_da_cursor(servidor, notepad) -> None:
-    """CA-08: truncated=true, returned bate, next_cursor e hint presentes."""
-    from mcp_windows_uia.server import uia_get_tree
-
-    wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    r = await uia_get_tree(window_ref=wref, filter="all", max_nodes=5)
-
-    assert r["stats"]["returned"] == 5
-    if r["stats"]["truncated"]:
-        assert r["stats"]["next_cursor"] is not None
-        assert "hint" in r["stats"]
-
-
-async def test_ca13_janela_fora_da_allowlist_e_negada(servidor) -> None:
-    """CA-13: APP_NOT_ALLOWED nomeia o processo e instrui sobre config."""
-    from mcp_windows_uia.server import uia_get_tree
-    from mcp_windows_uia.uia.windows import enumerate_windows
-
-    fora = [w for w in enumerate_windows() if w.process.lower() != "notepad.exe"]
-    if not fora:
-        pytest.skip("nenhuma janela fora da allowlist para testar")
-
-    wref = servidor.refs.window_ref(hwnd=fora[0].hwnd)
-    r = await uia_get_tree(window_ref=wref)
-
-    assert r["ok"] is False
-    assert r["error"]["code"] == "APP_NOT_ALLOWED"
-    assert "config.toml" in r["error"]["hint"]
-
-
-async def test_window_ref_desconhecida_e_erro_acionavel(servidor) -> None:
-    from mcp_windows_uia.server import uia_get_tree
-
-    r = await uia_get_tree(window_ref="w99999")
-    assert r["ok"] is False
-    assert r["error"]["code"] in ("WINDOW_NOT_FOUND", "REF_NOT_FOUND")
-    assert "uia_list_windows" in r["error"]["hint"]
+@pytest.fixture()
+def wref(servidor, notepad) -> str:
+    return servidor.refs.window_ref(hwnd=notepad.hwnd)
 ```
 
-- [ ] **Step 2: Rodar e confirmar que falha**
+O apelido `notepad` nao abre uma segunda janela: e a MESMA fixture de sessao do
+conftest. Existe para que as Tasks 8 em diante possam seguir importando
+`from tests.e2e.test_tool_get_tree import notepad, servidor` como ja estava escrito.
+
+Testes exigidos (todos `async`; `asyncio_mode = "auto"` no `pyproject.toml`):
+
+1. `uia_get_tree` devolve `ok: True`, o mesmo `window_ref`, `nodes` nao vazio e `stats`.
+2. **CA-08 completo** — com `filter="all", max_nodes=5`: `stats.returned == 5`,
+   `stats.truncated is True`, `stats.next_cursor` nao nulo, `stats.hint` presente. E a
+   chamada seguinte passando esse cursor devolve nos diferentes: intersecao dos `ref`
+   das duas paginas e vazia, e o `tree_version` devolvido e o mesmo.
+3. A concatenacao das duas paginas de 5 bate, ref a ref, com uma captura unica de 10.
+4. **CA-13** — janela fora da allowlist devolve `ok: False`,
+   `error.code == "APP_NOT_ALLOWED"` e `"config.toml"` no `error.hint`.
+5. `window_ref` desconhecida devolve erro acionavel com `"uia_list_windows"` no hint.
+6. Cursor corrompido, cursor de outra janela e cursor de versao vencida devolvem
+   `INVALID_ARGUMENT` sem estourar excecao.
+
+- [ ] **Step 4: Rodar e confirmar que falha**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/e2e/test_tool_get_tree.py -q`
 Expected: FAIL — `ImportError: cannot import name 'uia_get_tree'`
 
-- [ ] **Step 3: Acrescentar o helper de resolução de janela em `server.py`**
+- [ ] **Step 5: Acrescentar o helper de resolucao de janela em `server.py`**
 
-Inserir logo após a função `tool_errors`:
+Inserir logo apos a funcao `tool_errors`:
 
 ```python
-def resolver_janela(ctx: ServerContext, window_ref: str) -> "WindowInfo":
+def resolver_janela(ctx: ServerContext, window_ref: str) -> WindowInfo:
     """window_ref -> WindowInfo viva, com allowlist ja validada.
 
     Erros distintos de proposito: ref desconhecida, janela morta e janela negada
     exigem acoes diferentes do agente.
     """
-    from .uia.windows import enumerate_windows, window_is_alive
-
     if not ctx.refs.known_window(window_ref):
         raise ToolError(
             Code.WINDOW_NOT_FOUND,
@@ -1973,18 +1983,55 @@ def resolver_janela(ctx: ServerContext, window_ref: str) -> "WindowInfo":
     return janela
 ```
 
-Acrescentar o import no topo do arquivo:
+Ajustar os imports do topo do arquivo:
 
 ```python
+from .budget import decode_cursor, encode_cursor
 from .uia.windows import WindowInfo, enumerate_windows, server_is_elevated, window_is_alive
 ```
 
-- [ ] **Step 4: Implementar `uia_get_tree` em `server.py`**
+- [ ] **Step 6: Implementar `uia_get_tree` em `server.py`**
 
-Acrescentar ao fim de `server.py`:
+Acrescentar ao fim de `server.py`. Validacao do cursor primeiro:
 
 ```python
-# --------------------------------------------------------------------------- 8.2
+def _retomar_do_cursor(ctx: ServerContext, window_ref: str, cursor: str) -> tuple[int, int]:
+    """Valida um cursor de continuacao e devolve (tree_version, pular). Spec §5.2.
+
+    O cursor carrega a janela e a versao da arvore justamente para nao continuar
+    uma captura sobre outra coisa: cursor de outra janela, ou de uma versao ja
+    vencida por um uia_get_tree posterior, descreveria posicoes de uma travessia
+    que nao existe mais. Em qualquer um desses casos a saida e a mesma — repetir a
+    chamada SEM cursor —, entao o hint diz isso explicitamente.
+    """
+    # decode_cursor ja levanta INVALID_ARGUMENT para corrompido e para expirado.
+    janela_do_cursor, versao_do_cursor, pular = decode_cursor(cursor)
+
+    versao_atual = ctx.refs.tree_version(window_ref)
+    if janela_do_cursor != window_ref:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            f"This cursor belongs to window {janela_do_cursor!r}, not {window_ref!r}.",
+            hint="Call uia_get_tree again for this window without a cursor.",
+            window_ref=window_ref,
+        )
+    if versao_do_cursor != versao_atual:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            f"This cursor is for tree_version {versao_do_cursor}, "
+            f"but the window is now at {versao_atual}.",
+            hint="The tree was re-captured meanwhile. Call uia_get_tree again without a cursor.",
+            window_ref=window_ref,
+            tree_version=versao_atual,
+        )
+    if pular < 0:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            "This cursor carries a negative position.",
+            hint="Call uia_get_tree again without a cursor.",
+            window_ref=window_ref,
+        )
+    return versao_atual, pular
 
 
 def get_tree_impl(
@@ -1995,6 +2042,7 @@ def get_tree_impl(
     max_depth: int | None,
     max_nodes: int,
     max_children_per_node: int,
+    cursor: str | None,
     verbose: bool,
 ) -> dict[str, Any]:
     """Corpo sincrono de uia_get_tree. Roda na thread do worker."""
@@ -2005,10 +2053,22 @@ def get_tree_impl(
 
     inicio = time.perf_counter()
     janela = resolver_janela(ctx, window_ref)
-    versao = ctx.refs.bump_tree_version(window_ref)
+
+    # Com cursor a versao NAO incrementa: ela e o que valida a continuacao. Se cada
+    # pagina bumpasse, a pagina 2 nunca casaria com o cursor emitido pela pagina 1.
+    if cursor is None:
+        versao = ctx.refs.bump_tree_version(window_ref)
+        pular = 0
+    else:
+        versao, pular = _retomar_do_cursor(ctx, window_ref, cursor)
 
     def registrar(elem: Any, indice: int) -> str:
-        """Registra o elemento no RefStore e devolve a ref estavel."""
+        """Registra o elemento no RefStore e devolve a ref estavel.
+
+        Chamado tambem para os nos PULADOS de uma pagina de continuacao. E de
+        proposito: RefStore.put deduplica por (hwnd, runtime_id) e devolve a ref ja
+        existente, entao as refs ficam estaveis entre paginas e o store nao cresce.
+        """
         return ctx.refs.put(
             elem,
             runtime_id=automation().runtime_id_of(elem),
@@ -2031,11 +2091,19 @@ def get_tree_impl(
         max_depth=max_depth,
         max_children_per_node=max_children_per_node,
         verbose=verbose,
+        pular=pular,
         atribuir_ref=registrar,
     )
 
     stats = capturado["stats"]
-    stats["next_cursor"] = None  # paginacao por cursor entra com o CA-08 completo
+    # next_cursor so existe quando ha continuacao real.
+    stats["next_cursor"] = (
+        encode_cursor(
+            window_ref, tree_version=versao, position=pular + len(capturado["nodes"])
+        )
+        if stats["truncated"]
+        else None
+    )
 
     ctx.audit.log_call(
         tool="uia_get_tree",
@@ -2070,11 +2138,16 @@ async def uia_get_tree(
     ] = None,
     max_nodes: Annotated[int, Field(ge=1, le=1500)] = 200,
     max_children_per_node: Annotated[int, Field(ge=1, le=500)] = 30,
+    cursor: Annotated[
+        str | None,
+        Field(description="Opaque cursor from a previous truncated call."),
+    ] = None,
     verbose: Annotated[bool, Field(description="Include HelpText/FullDescription.")] = False,
 ) -> dict[str, Any]:
     """Capture the UI Automation tree of a window as a flat, pre-order list of nodes with
     stable refs. Defaults to interactive elements only. Omit max_depth so the server can
-    go deeper automatically in deeply nested apps such as Electron or WebView2."""
+    go deeper automatically in deeply nested apps such as Electron or WebView2. When
+    stats.truncated is true, pass stats.next_cursor back to continue where it stopped."""
     ctx = context()
     return await ctx.worker.run(
         lambda: get_tree_impl(
@@ -2084,26 +2157,34 @@ async def uia_get_tree(
             max_depth=max_depth,
             max_nodes=max_nodes,
             max_children_per_node=max_children_per_node,
+            cursor=cursor,
             verbose=verbose,
         )
     )
 ```
 
-- [ ] **Step 5: Rodar os testes e2e**
+- [ ] **Step 7: Rodar os testes**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/e2e/test_tool_get_tree.py -q`
-Expected: PASS — 4 passed
+Expected: PASS — 8 passed
 
-- [ ] **Step 6: Verificar que a tool aparece no `tools/list`**
+Run: `.venv/Scripts/python.exe -m pytest -q`
+Expected: PASS — 224 passed (era 206)
+
+- [ ] **Step 8: Verificar que a tool aparece no `tools/list`**
 
 Run: `.venv/Scripts/python.exe -c "from mcp_windows_uia.server import mcp; import asyncio; print([t.name for t in asyncio.run(mcp.list_tools())])"`
 Expected: contém `uia_list_windows` e `uia_get_tree`
 
-- [ ] **Step 7: Commit**
+**Pendencia conhecida:** o CA-13 da spec tambem exige uma linha `"result":"denied"` no
+log de auditoria quando a allowlist bloqueia. Hoje so o caminho de sucesso e auditado
+(em todas as tools, nao so nesta) — fica para uma passada propria sobre `tool_errors`.
+
+- [ ] **Step 9: Commit**
 
 ```bash
-git add src/mcp_windows_uia/server.py tests/e2e/test_tool_get_tree.py
-git commit -m "feat(server): tool uia_get_tree com registro de refs, cobre CA-08/CA-13"
+git add -A
+git commit -m "feat(server): tool uia_get_tree com paginacao por cursor, cobre CA-08/CA-13"
 ```
 
 ---
