@@ -46,6 +46,25 @@ Separar `nodes.py` de `filters.py` de `tree.py` é deliberado: o filtro é lógi
 
 ### Task 1: `uia/nodes.py` — serialização do nó da §5.1
 
+> **Corrigido depois da execução.** O código abaixo lê `CachedToggleToggleState`,
+> `CachedValueValue`, `CachedValueIsReadOnly`, `CachedRangeValueValue`,
+> `CachedSelectionItemIsSelected` e `CachedExpandCollapseExpandCollapseState` por
+> `getattr`. **Nenhum desses nomes existe** em `IUIAutomationElement`: o typelib
+> declara 32 propriedades `Cached*` fixas e as derivadas de pattern não estão entre
+> elas. Todas caíam no default e nenhum nó recebia `checked`, `selected`, `expanded`,
+> `readonly` ou `val` — o que anulava a regra da §6.2 que rebaixa `Value` a
+> não-acionável quando é somente-leitura.
+>
+> A leitura certa é `GetCachedPropertyValue(prop_id)`, **com portão de disponibilidade
+> do pattern**: medido no Bloco de Notas, um provider que não suporta o pattern devolve
+> o *default* (`ToggleState=2`, `IsReadOnly=True`), não vazio — trocar sem o portão
+> marcaria a árvore inteira como `indeterminate` e `readonly`. Ver `uia/nodes.py`
+> (`_PROPS_DE_PATTERN`, `_de_pattern`) e `tests/e2e/test_nodes_reais.py`.
+>
+> O fake abaixo também mentia: expunha as duas famílias como atributo, e foi por isso
+> que os testes unitários não pegaram nada. O fake atual imita a interface real e
+> devolve o mesmo default do provider.
+
 **Files:**
 - Create: `src/mcp_windows_uia/uia/nodes.py`
 - Test: `tests/test_uia_nodes.py`

@@ -1,16 +1,36 @@
 from __future__ import annotations
 
+import pytest
+
+from mcp_windows_uia.uia import nodes
 from mcp_windows_uia.uia.nodes import STATE_KEYS, build_node, states_of
+
+# Ids ficticios: mantem estes testes puros, sem carregar o typelib do Windows.
+IDS_FALSOS = {chave: 900 + i for i, (chave, _p, _n) in enumerate(nodes._PROPS_DE_PATTERN)}
+
+
+@pytest.fixture(autouse=True)
+def _ids_sem_com(monkeypatch):
+    monkeypatch.setattr(nodes, "_ids_de_prop", IDS_FALSOS)
 
 
 class FakeCached:
-    """Stand-in de IUIAutomationElement com propriedades Cached*.
+    """Stand-in de IUIAutomationElement, fiel na forma de acesso.
 
-    build_node so le Cached*, entao qualquer objeto com esses atributos serve.
-    Isso mantem a serializacao testavel sem Windows.
+    A distincao importa: as ~32 propriedades `Cached*` do typelib sao atributos, mas as
+    derivadas de pattern SO existem via GetCachedPropertyValue(prop_id). O fake antigo
+    expunha as duas como atributo — ficcao que escondeu por tres tasks o fato de
+    `CachedToggleToggleState` nao existir na interface.
+
+    E devolve o mesmo veneno que o provider real devolve quando o pattern nao existe,
+    para que o portao de disponibilidade seja provado aqui, e nao so contra o Windows.
     """
 
-    def __init__(self, **kw):
+    # Medido no Bloco de Notas: e isto que volta para quem NAO suporta o pattern.
+    VENENO = {"toggle": 2, "expand": 3, "selected": True,
+              "readonly": True, "value": "", "range": 0.0}
+
+    def __init__(self, *, props: dict[str, object] | None = None, **kw):
         padrao = {
             "CachedName": "",
             "CachedAutomationId": "",
@@ -23,16 +43,17 @@ class FakeCached:
             "CachedIsPassword": 0,
             "CachedProcessId": 100,
             "CachedBoundingRectangle": (0, 0, 10, 10),
-            "CachedToggleToggleState": None,
-            "CachedExpandCollapseExpandCollapseState": None,
-            "CachedSelectionItemIsSelected": None,
-            "CachedValueValue": None,
-            "CachedValueIsReadOnly": None,
-            "CachedRangeValueValue": None,
         }
         padrao.update(kw)
         for k, v in padrao.items():
             setattr(self, k, v)
+        self._props = props or {}
+
+    def GetCachedPropertyValue(self, prop_id: int):
+        for chave, ident in IDS_FALSOS.items():
+            if ident == prop_id:
+                return self._props.get(chave, self.VENENO[chave])
+        raise ValueError(f"propriedade {prop_id} fora do CacheRequest")
 
 
 def test_node_tem_as_chaves_obrigatorias_da_spec() -> None:
@@ -83,13 +104,30 @@ def test_disabled_e_offscreen_sao_explicitos() -> None:
 
 
 def test_toggle_state_vira_checked_unchecked_indeterminate() -> None:
-    assert "unchecked" in states_of(FakeCached(CachedToggleToggleState=0))
-    assert "checked" in states_of(FakeCached(CachedToggleToggleState=1))
-    assert "indeterminate" in states_of(FakeCached(CachedToggleToggleState=2))
+    for estado, rotulo in [(0, "unchecked"), (1, "checked"), (2, "indeterminate")]:
+        assert rotulo in states_of(FakeCached(props={"toggle": estado}), ["Toggle"])
+
+
+def test_sem_o_pattern_nenhum_estado_derivado_aparece() -> None:
+    """O portao da §5.1: provider que nao suporta o pattern devolve default, nao vazio.
+
+    Sem checar disponibilidade, todo Pane e todo Button sairiam "indeterminate" e
+    "readonly" — medido no Bloco de Notas real.
+    """
+    st = states_of(FakeCached(), patterns=[])
+    for fantasma in ("checked", "unchecked", "indeterminate", "expanded",
+                     "collapsed", "selected", "readonly"):
+        assert fantasma not in st
+
+
+def test_pattern_de_um_tipo_nao_libera_propriedade_de_outro() -> None:
+    st = states_of(FakeCached(), patterns=["Toggle"])
+    assert "indeterminate" in st  # Toggle existe: o veneno 2 e resposta legitima
+    assert "readonly" not in st   # Value nao existe: continua barrado
 
 
 def test_valor_de_toggle_vai_para_val() -> None:
-    n = build_node(FakeCached(CachedToggleToggleState=1), ref="w1-e1", depth=0,
+    n = build_node(FakeCached(props={"toggle": 1}), ref="w1-e1", depth=0,
                    patterns=["Toggle"])
     assert n["val"] == "on"
 
@@ -97,7 +135,7 @@ def test_valor_de_toggle_vai_para_val() -> None:
 def test_campo_de_senha_nunca_expoe_o_valor() -> None:
     """Spec §5.1: regra de redacao. CA-15 depende disto."""
     n = build_node(
-        FakeCached(CachedIsPassword=1, CachedValueValue="s3nh4-secreta"),
+        FakeCached(CachedIsPassword=1, props={"value": "s3nh4-secreta"}),
         ref="w1-e9", depth=3, patterns=["Value"],
     )
     assert n["val"] == "«redacted:password»"
