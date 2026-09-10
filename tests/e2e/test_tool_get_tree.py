@@ -148,6 +148,7 @@ async def test_ca13_janela_fora_da_allowlist_e_negada(servidor) -> None:
         if linha.get("result") == "denied" and linha.get("code") == "APP_NOT_ALLOWED"
     ]
     assert negadas, 'CA-13 exige uma linha "result":"denied" no log de auditoria'
+    assert negadas[-1]["target"]["process"] == alvo.process
     assert "value" not in negadas[-1]
 
 

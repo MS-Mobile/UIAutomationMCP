@@ -45,6 +45,11 @@ PARAMS_AUDITAVEIS = frozenset(
 )
 
 
+# Campos do `target` da §10.3, colhidos do ToolError. `check_window` anexa `process` e
+# `title` ao erro; sem isto a linha "denied" diria que algo foi barrado, mas nao o que.
+CAMPOS_DE_TARGET = ("window_ref", "hwnd", "pid", "process", "title")
+
+
 def _auditar_falha(tool: str, exc: ToolError, kwargs: dict[str, Any], inicio: float) -> None:
     """Grava a linha de falha. Nunca levanta: auditoria nao pode derrubar a chamada."""
     try:
@@ -57,7 +62,8 @@ def _auditar_falha(tool: str, exc: ToolError, kwargs: dict[str, Any], inicio: fl
             tool=tool,
             result="denied" if exc.code in POLICY_DENIALS else "error",
             code=exc.code.value,
-            params={k: v for k, v in kwargs.items() if k in PARAMS_AUDITAVEIS},
+            target={k: exc.details[k] for k in CAMPOS_DE_TARGET if k in exc.details} or None,
+            params={k: v for k, v in kwargs.items() if k in PARAMS_AUDITAVEIS} or None,
             duration_ms=(time.perf_counter() - inicio) * 1000,
             read_only=ctx.policy.read_only,
         )

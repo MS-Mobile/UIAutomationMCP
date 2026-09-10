@@ -63,6 +63,34 @@ async def test_negacao_de_policy_vira_result_denied(ctx) -> None:
     assert registro["params"] == {"window_ref": "w1"}
 
 
+async def test_a_linha_denied_diz_qual_app_foi_barrado(ctx) -> None:
+    """Sem o target, a auditoria registraria que algo foi negado, mas nao o que."""
+    from mcp_windows_uia.policy import Policy
+
+    @tool_errors
+    async def uia_falsa(window_ref: str):
+        Policy(ctx.config).check_window("calc.exe", "Calculadora", window_ref=window_ref)
+
+    await uia_falsa(window_ref="w1")
+
+    alvo = linhas(ctx)[-1]["target"]
+    assert alvo["process"] == "calc.exe"
+    assert alvo["title"] == "Calculadora"
+    assert alvo["window_ref"] == "w1"
+
+
+async def test_elevation_required_e_error_nao_denied(ctx) -> None:
+    """Apesar do nome, ele vem do mapeamento de E_ACCESSDENIED: o Windows negando,
+    nao o servidor recusando por configuracao."""
+
+    @tool_errors
+    async def uia_falsa(ref: str):
+        raise ToolError(Code.ELEVATION_REQUIRED, "target runs elevated")
+
+    await uia_falsa(ref="w1-e2")
+    assert linhas(ctx)[-1]["result"] == "error"
+
+
 async def test_falha_que_nao_e_policy_vira_result_error(ctx) -> None:
     """Distinguir importa: 'denied' e o servidor recusando, 'error' e algo quebrando."""
 

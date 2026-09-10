@@ -119,7 +119,9 @@ POLICY_DENIALS: frozenset[Code] = frozenset(
         Code.APP_NOT_ALLOWED,
         Code.READ_ONLY_MODE,
         Code.BLOCKED_ACTION,
-        Code.ELEVATION_REQUIRED,
+        # ELEVATION_REQUIRED de fora de proposito: apesar do nome, ele nao e o
+        # servidor recusando por configuracao. Vem do mapeamento de E_ACCESSDENIED
+        # (0x80070005), ou seja, e o Windows negando — "error", nao "denied".
     }
 )
 
