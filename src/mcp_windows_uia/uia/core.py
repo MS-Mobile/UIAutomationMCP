@@ -162,6 +162,16 @@ class Automation:
     def element_from_handle(self, hwnd: int) -> Any:
         return self.iuia.ElementFromHandle(hwnd)
 
+    def element_from_handle_build_cache(self, hwnd: int, cache_request: Any) -> Any:
+        """Raiz JA materializada pelo cache_request.
+
+        `ElementFromHandle` devolve um elemento com cache VAZIO. Ler dele custa um
+        RPC por propriedade e, pior, `GetCachedPropertyValue` levanta E_INVALIDARG
+        (0x80070057) — o que faz a raiz da captura entrar na arvore serializada como
+        lixo silencioso, ja que `nodes._cached` engole a excecao e devolve o default.
+        """
+        return self.iuia.ElementFromHandleBuildCache(hwnd, cache_request)
+
     def runtime_id_of(self, element: Any) -> tuple[int, ...]:
         try:
             return tuple(element.GetRuntimeId())

@@ -16,6 +16,8 @@ from ..budget import (
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_NODES,
     HARD_MAX_DEPTH,
+    HARD_MAX_NODES,
+    TRUNCATION_HINT,
     clamp,
 )
 
@@ -122,3 +124,130 @@ def _filhos_limitados(
         r.elididos[no] = len(filhos) - orcamento.max_children_per_node
         return filhos[: orcamento.max_children_per_node]
     return filhos
+
+
+# ---------------------------------------------------------------- ponte com COM
+
+
+def _patterns_disponiveis(elem: Any, props_de_pattern: dict[str, int]) -> list[str]:
+    """Patterns suportados, lidos do cache. Zero RPC.
+
+    IUIAutomationElement NAO expoe `CachedIsXxxPatternAvailable` como atributo: o
+    typelib so declara ~30 propriedades `Cached*` fixas, e disponibilidade de pattern
+    nao esta entre elas. Um `getattr` por nome devolveria o default para todo mundo e
+    `pat` sairia vazio em cada no — com o filtro "interactive" da §6.2 caindo no
+    criterio de reserva ("focusable"), que deixa passar Panes e perde Buttons de
+    provider que nao marca IsKeyboardFocusable.
+
+    GetCachedPropertyValue le do CacheRequest ja materializado (as 32 propriedades
+    IsXxxPatternAvailable entram via `tree_props`), portanto continua sem RPC:
+    medido em 0,18 ms para as 32 propriedades de um no.
+    """
+    return [
+        nome
+        for nome, prop_id in props_de_pattern.items()
+        if elem.GetCachedPropertyValue(prop_id)
+    ]
+
+
+def filhos_cacheados(automation: Any, cache_request: Any):
+    """Navegador que fala COM: um FindAllBuildCache(Children) por no-pai (§5.2)."""
+    UIA = automation.UIA
+
+    def _filhos(elem: Any, _nivel: int) -> list[Any]:
+        try:
+            achados = elem.FindAllBuildCache(
+                UIA.TreeScope_Children, automation.true_condition, cache_request
+            )
+        except Exception:
+            # No que sumiu ou provider que recusou: subarvore vazia, nao aborta a captura.
+            return []
+        return [achados.GetElement(i) for i in range(achados.Length)]
+
+    return _filhos
+
+
+def capturar_janela(
+    hwnd: int,
+    *,
+    filtro: str = "interactive",
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_depth: int | None = None,
+    max_children_per_node: int = DEFAULT_MAX_CHILDREN,
+    verbose: bool = False,
+    atribuir_ref: Callable[[Any, int], str] | None = None,
+) -> dict[str, Any]:
+    """Captura a arvore de uma janela dentro do orcamento. Spec §5.2.
+
+    `atribuir_ref` e injetado pelo servidor para registrar cada no no RefStore.
+    Ausente (uso em teste), gera refs sinteticas.
+    """
+    from . import core
+    from .filters import passa_no_filtro
+    from .nodes import build_node
+
+    automation = core.automation()
+    cache_request = automation.build_cache_request(automation.tree_props())
+    raiz = automation.element_from_handle_build_cache(hwnd, cache_request)
+
+    props_de_pattern = core.pattern_availability_props()
+    navegador = filhos_cacheados(automation, cache_request)
+
+    # `percorrer` chama _aprovado uma vez por no visitado e, quando True, faz append
+    # em emitidos na mesma ordem. Entao aprovados[i] corresponde a r.emitidos[i] —
+    # sem mapa por id(), que seria fragil com ponteiros COM.
+    aprovados: list[dict[str, Any]] = []
+    contador = [0]
+
+    def _aprovado(elem: Any, nivel: int) -> bool:
+        # Serializa com ref provisoria: o filtro nao olha para `ref`, e cunhar a ref
+        # antes de saber se o no passa desperdicaria numeros e (pior) registraria no
+        # RefStore elementos que nunca serao devolvidos ao agente.
+        node = build_node(
+            elem,
+            ref="",
+            depth=nivel,
+            patterns=_patterns_disponiveis(elem, props_de_pattern),
+            verbose=verbose,
+        )
+        if not passa_no_filtro(node, filtro):
+            return False
+
+        node["ref"] = (
+            atribuir_ref(elem, contador[0])
+            if atribuir_ref is not None
+            else f"w{hwnd}-e{contador[0]}"
+        )
+        contador[0] += 1
+        aprovados.append(node)
+        return True
+
+    orcamento = CaptureBudget(
+        max_nodes=clamp(max_nodes, 1, HARD_MAX_NODES),
+        max_depth=DEFAULT_MAX_DEPTH if max_depth is None else max_depth,
+        max_children_per_node=max_children_per_node,
+        depth_is_default=max_depth is None,
+    )
+
+    r = percorrer(raiz, navegador, _aprovado, orcamento)
+
+    nodes: list[dict[str, Any]] = []
+    for (elem, _nivel), node in zip(r.emitidos, aprovados, strict=True):
+        elididos = r.elididos.get(elem)
+        if elididos:
+            node["n"] = elididos
+        nodes.append(node)
+
+    stats: dict[str, Any] = {
+        "returned": len(nodes),
+        "visited": r.visitados,
+        "truncated": r.truncado,
+        "depth_reached": r.depth_reached,
+    }
+    if r.auto_deepened:
+        stats["auto_deepened"] = True
+        stats["depth_requested"] = DEFAULT_MAX_DEPTH
+    if r.truncado:
+        stats["hint"] = TRUNCATION_HINT
+
+    return {"nodes": nodes, "stats": stats}

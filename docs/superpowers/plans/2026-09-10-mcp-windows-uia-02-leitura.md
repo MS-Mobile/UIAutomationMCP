@@ -548,6 +548,7 @@ git commit -m "feat(uia): predicados de filtragem da spec 6.2, puros e sem COM"
 
 **Files:**
 - Create: `src/mcp_windows_uia/uia/tree.py`
+- Modify: `src/mcp_windows_uia/uia/core.py` (acrescenta `element_from_handle_build_cache`)
 - Test: `tests/test_uia_tree.py` (unitário, com fakes)
 - Test: `tests/e2e/test_tree_captura.py` (e2e, contra janela real)
 
@@ -861,24 +862,60 @@ def sta():
     core.reset_for_tests()
 
 
+def _janelas_do_bloco_de_notas() -> dict[int, object]:
+    from mcp_windows_uia.uia.windows import enumerate_windows
+
+    return {
+        w.hwnd: w
+        for w in enumerate_windows()
+        if (w.process or "").lower() == "notepad.exe"
+    }
+
+
 @pytest.fixture(scope="module")
 def bloco_de_notas(sta):
-    """Abre um Bloco de Notas dedicado e o fecha ao fim."""
-    from mcp_windows_uia.uia.windows import enumerate_windows
+    """Abre um Bloco de Notas e o fecha ao fim.
+
+    Nao da para casar a janela por `proc.pid`: no Windows 11 o `notepad.exe` do
+    System32 e um alias de execucao que delega para o app empacotado
+    (`Notepad.exe` de WindowsApps) e o PID da janela e outro. Alem disso o app
+    restaura as janelas da sessao anterior, entao "a janela do meu PID" tambem
+    seria ambigua. Casamos por HWND novo, que e exato nos dois casos.
+    """
+    import psutil
+
+    antes = _janelas_do_bloco_de_notas()
+    ja_havia = bool(antes)
 
     proc = subprocess.Popen(["notepad.exe"])
     janela = None
     for _ in range(50):
         time.sleep(0.2)
-        candidatas = [w for w in enumerate_windows() if w.pid == proc.pid and w.title]
-        if candidatas:
-            janela = candidatas[0]
+        novas = [w for h, w in _janelas_do_bloco_de_notas().items() if h not in antes and w.title]
+        if novas:
+            janela = novas[0]
             break
     if janela is None:
         proc.terminate()
         pytest.skip("Bloco de Notas nao abriu a tempo")
+
     yield janela
+
     proc.terminate()
+    if ja_havia:
+        # O usuario ja tinha Bloco de Notas aberto: fecha so a janela que abrimos.
+        import ctypes
+
+        ctypes.windll.user32.PostMessageW(janela.hwnd, 0x0010, 0, 0)  # WM_CLOSE
+    else:
+        # Nao havia nenhum: tudo que esta na tela veio de nos (inclusive as janelas
+        # que o app restaurou da sessao anterior). Derruba o processo inteiro.
+        for p in psutil.process_iter(["pid", "name"]):
+            if (p.info["name"] or "").lower() == "notepad.exe":
+                try:
+                    p.kill()
+                except psutil.Error:
+                    pass
 
 
 def test_ca02_arvore_interativa_e_enxuta(bloco_de_notas) -> None:
@@ -934,21 +971,50 @@ Expected: FAIL — `ImportError: cannot import name 'capturar_janela'`
 
 - [ ] **Step 8: Implementar `capturar_janela` em `uia/tree.py`**
 
-Acrescentar ao fim de `src/mcp_windows_uia/uia/tree.py`:
+Primeiro, acrescentar a `Automation` em `src/mcp_windows_uia/uia/core.py`, ao lado de
+`element_from_handle`:
+
+```python
+    def element_from_handle_build_cache(self, hwnd: int, cache_request: Any) -> Any:
+        """Raiz JA materializada pelo cache_request.
+
+        `ElementFromHandle` devolve um elemento com cache VAZIO. Ler dele custa um
+        RPC por propriedade e, pior, `GetCachedPropertyValue` levanta E_INVALIDARG
+        (0x80070057) — o que faz a raiz da captura entrar na arvore serializada como
+        lixo silencioso, ja que `nodes._cached` engole a excecao e devolve o default.
+        """
+        return self.iuia.ElementFromHandleBuildCache(hwnd, cache_request)
+```
+
+Depois, no topo de `src/mcp_windows_uia/uia/tree.py`, somar `HARD_MAX_NODES` e
+`TRUNCATION_HINT` ao import de `..budget` (o plano original os importava dentro da
+funcao; no topo nao ha risco de ciclo, `budget` nao importa `uia`).
+
+Por fim, acrescentar ao fim de `src/mcp_windows_uia/uia/tree.py`:
 
 ```python
 # ---------------------------------------------------------------- ponte com COM
 
 
 def _patterns_disponiveis(elem: Any, props_de_pattern: dict[str, int]) -> list[str]:
-    """Patterns acionaveis suportados, lidos do cache. Zero RPC."""
-    from .nodes import _cached
+    """Patterns suportados, lidos do cache. Zero RPC.
 
-    disponiveis: list[str] = []
-    for nome in props_de_pattern:
-        if _cached(elem, f"CachedIs{nome}PatternAvailable", 0):
-            disponiveis.append(nome)
-    return disponiveis
+    IUIAutomationElement NAO expoe `CachedIsXxxPatternAvailable` como atributo: o
+    typelib so declara ~30 propriedades `Cached*` fixas, e disponibilidade de pattern
+    nao esta entre elas. Um `getattr` por nome devolveria o default para todo mundo e
+    `pat` sairia vazio em cada no — com o filtro "interactive" da §6.2 caindo no
+    criterio de reserva ("focusable"), que deixa passar Panes e perde Buttons de
+    provider que nao marca IsKeyboardFocusable.
+
+    GetCachedPropertyValue le do CacheRequest ja materializado (as 32 propriedades
+    IsXxxPatternAvailable entram via `tree_props`), portanto continua sem RPC:
+    medido em 0,18 ms para as 32 propriedades de um no.
+    """
+    return [
+        nome
+        for nome, prop_id in props_de_pattern.items()
+        if elem.GetCachedPropertyValue(prop_id)
+    ]
 
 
 def filhos_cacheados(automation: Any, cache_request: Any):
@@ -983,14 +1049,15 @@ def capturar_janela(
     `atribuir_ref` e injetado pelo servidor para registrar cada no no RefStore.
     Ausente (uso em teste), gera refs sinteticas.
     """
-    from ..budget import HARD_MAX_NODES, TRUNCATION_HINT
     from . import core
     from .filters import passa_no_filtro
     from .nodes import build_node
 
     automation = core.automation()
     cache_request = automation.build_cache_request(automation.tree_props())
-    raiz = automation.element_from_handle(hwnd)
+    # ElementFromHandle devolve elemento com cache VAZIO: GetCachedPropertyValue nele
+    # levanta E_INVALIDARG e a raiz entraria na arvore como lixo silencioso.
+    raiz = automation.element_from_handle_build_cache(hwnd, cache_request)
 
     props_de_pattern = core.pattern_availability_props()
     navegador = filhos_cacheados(automation, cache_request)
@@ -1068,7 +1135,7 @@ Expected: PASS — nenhuma regressão
 - [ ] **Step 11: Commit**
 
 ```bash
-git add src/mcp_windows_uia/uia/tree.py tests/e2e/test_tree_captura.py
+git add src/mcp_windows_uia/uia/tree.py src/mcp_windows_uia/uia/core.py         tests/e2e/test_tree_captura.py
 git commit -m "feat(uia): capturar_janela com CacheRequest por nivel, cobre CA-02/CA-09/CA-21"
 ```
 
