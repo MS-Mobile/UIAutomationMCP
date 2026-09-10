@@ -111,6 +111,19 @@ DEFAULT_HINTS: dict[Code, str] = {
     ),
 }
 
+# Negacoes de policy. A spec §10.3 pede que elas apareçam na auditoria como
+# "result":"denied", distintas de "error": uma e o servidor recusando por
+# configuracao, a outra e algo que deu errado. O CA-13 verifica essa linha.
+POLICY_DENIALS: frozenset[Code] = frozenset(
+    {
+        Code.APP_NOT_ALLOWED,
+        Code.READ_ONLY_MODE,
+        Code.BLOCKED_ACTION,
+        Code.ELEVATION_REQUIRED,
+    }
+)
+
+
 RETRYABLE: frozenset[Code] = frozenset(
     {
         Code.SESSION_UNAVAILABLE,

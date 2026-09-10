@@ -24,7 +24,7 @@ from pydantic import Field
 
 from .budget import decode_cursor, encode_cursor
 from .context import ServerContext, context
-from .errors import Code, ToolError
+from .errors import POLICY_DENIALS, Code, ToolError
 from .uia.windows import WindowInfo, enumerate_windows, server_is_elevated, window_is_alive
 
 _log = logging.getLogger(__name__)
@@ -32,20 +32,62 @@ _log = logging.getLogger(__name__)
 mcp = MCPServer("windows-uia")
 
 
+# Parametros que podem ir para a auditoria de uma falha. Allowlist, nao denylist:
+# o que nao esta aqui pode carregar conteudo do usuario (`value` de uia_set_value,
+# `keys` de uia_send_keys) e a regra da §10.3/CA-15 e que valor nunca vaza por
+# acidente. Parametro novo so aparece no log depois de alguem decidir que pode.
+PARAMS_AUDITAVEIS = frozenset(
+    {
+        "window_ref", "ref", "filter", "max_depth", "max_nodes",
+        "max_children_per_node", "verbose", "cursor", "timeout_ms",
+        "only_interactive", "max_results", "state", "scope", "mode", "method",
+    }
+)
+
+
+def _auditar_falha(tool: str, exc: ToolError, kwargs: dict[str, Any], inicio: float) -> None:
+    """Grava a linha de falha. Nunca levanta: auditoria nao pode derrubar a chamada."""
+    try:
+        ctx = context()
+    except RuntimeError:
+        # Falhou antes do servidor subir (so acontece fora do processo real).
+        return
+    try:
+        ctx.audit.log_call(
+            tool=tool,
+            result="denied" if exc.code in POLICY_DENIALS else "error",
+            code=exc.code.value,
+            params={k: v for k, v in kwargs.items() if k in PARAMS_AUDITAVEIS},
+            duration_ms=(time.perf_counter() - inicio) * 1000,
+            read_only=ctx.policy.read_only,
+        )
+    except Exception:  # pragma: no cover - rede de seguranca
+        _log.exception("falha ao auditar erro de %s", tool)
+
+
 def tool_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Converte qualquer falha no envelope de erro da §9. Nunca deixa vazar traceback."""
+    """Converte qualquer falha no envelope de erro da §9. Nunca deixa vazar traceback.
+
+    Audita SO a falha: o caminho de sucesso ja e auditado dentro de cada `*_impl`,
+    que e onde se sabe o processo alvo e o metodo usado. Auditar aqui tambem
+    duplicaria a linha.
+    """
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        inicio = time.perf_counter()
         try:
             return await fn(*args, **kwargs)
         except ToolError as exc:
+            _auditar_falha(fn.__name__, exc, kwargs, inicio)
             return exc.to_dict()
         except Exception as exc:  # pragma: no cover - rede de seguranca
             _log.exception("unhandled error in %s", fn.__name__)
-            return ToolError(
+            erro = ToolError(
                 Code.UIA_COM_ERROR, f"Unhandled server error in {fn.__name__}: {exc!r}"
-            ).to_dict()
+            )
+            _auditar_falha(fn.__name__, erro, kwargs, inicio)
+            return erro.to_dict()
 
     return wrapper
 

@@ -14,8 +14,20 @@ from mcp_windows_uia.budget import encode_cursor
 pytestmark = pytest.mark.e2e
 
 
+def _linhas_de_auditoria(ctx) -> list[dict]:
+    """Le o JSONL de auditoria do contexto de teste."""
+    import json
+
+    linhas = []
+    for arquivo in sorted(ctx.config.audit.dir.glob("*.jsonl")):
+        for linha in arquivo.read_text(encoding="utf-8").splitlines():
+            if linha.strip():
+                linhas.append(json.loads(linha))
+    return linhas
+
+
 @pytest.fixture(scope="module")
-def servidor(sta):
+def servidor(sta, tmp_path_factory):
     """ServerContext com allowlist permitindo Bloco de Notas e Explorador."""
     from mcp_windows_uia.config import (
         AllowlistConfig,
@@ -31,7 +43,7 @@ def servidor(sta):
         server=ServerConfig(),
         allowlist=AllowlistConfig(processes=frozenset({"notepad.exe", "explorer.exe"})),
         denylist=DenylistConfig(processes=frozenset()),
-        audit=AuditConfig(),
+        audit=AuditConfig(dir=tmp_path_factory.mktemp("audit")),
         keys=KeysConfig(),
     )
     ctx = ServerContext(cfg)
@@ -129,6 +141,14 @@ async def test_ca13_janela_fora_da_allowlist_e_negada(servidor) -> None:
     assert r["error"]["code"] == "APP_NOT_ALLOWED"
     assert "config.toml" in r["error"]["hint"]
     assert alvo.process in r["error"]["message"] or alvo.process in str(r["error"]["details"])
+
+    # A terceira parte do CA-13: negacao de policy vira linha propria na auditoria.
+    negadas = [
+        linha for linha in _linhas_de_auditoria(servidor)
+        if linha.get("result") == "denied" and linha.get("code") == "APP_NOT_ALLOWED"
+    ]
+    assert negadas, 'CA-13 exige uma linha "result":"denied" no log de auditoria'
+    assert "value" not in negadas[-1]
 
 
 async def test_window_ref_desconhecida_e_erro_acionavel(servidor) -> None:
