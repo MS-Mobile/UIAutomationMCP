@@ -42,7 +42,7 @@ PARAMS_AUDITAVEIS = frozenset(
         "window_ref", "ref", "filter", "max_depth", "max_nodes",
         "max_children_per_node", "verbose", "cursor", "timeout_ms",
         "only_interactive", "max_results", "max_chars", "offset", "include_refs",
-        "root_ref", "state", "scope", "mode", "method",
+        "root_ref", "condition", "poll_ms", "state", "scope", "mode", "method",
     }
 )
 
@@ -1025,5 +1025,272 @@ async def uia_get_text(
             max_chars=max_chars,
             offset=offset,
             include_refs=include_refs,
+        )
+    )
+
+
+# --------------------------------------------------------------------------- 8.6
+
+CONDICOES = (
+    "appears",
+    "disappears",
+    "enabled",
+    "focused",
+    "value_equals",
+    "value_contains",
+    "window_appears",
+)
+# Condicoes que comparam contra um valor dado pelo chamador.
+CONDICOES_COM_EXPECTED = ("value_equals", "value_contains")
+
+# `esperar_por` para quando a sondagem devolve algo truthy, e "sumiu" nao tem
+# elemento para devolver. Um sentinela resolve sem fazer a ausencia parecer presenca.
+SUMIU = object()
+
+
+def _no_do_ref(ctx: ServerContext, ref: str) -> dict[str, Any] | None:
+    """Estado ATUAL do elemento de uma ref. None quando ele nao existe mais.
+
+    Refaz o cache: sem isso o `st` viria do instante da captura da arvore e a espera
+    por 'enabled' nunca terminaria — leria para sempre o mesmo estado congelado.
+
+    E aqui que a ref e validada. `ctx.refs.get` fica FORA do try de proposito: ref que
+    nunca existiu e um fato, e vira REF_NOT_FOUND na primeira sondagem; elemento que
+    morreu e uma condicao, e vira None — que e o que 'disappears' espera.
+    """
+    from .uia.core import automation, pattern_availability_props
+    from .uia.nodes import build_node
+    from .uia.tree import _patterns_disponiveis
+
+    entrada = ctx.refs.get(ref)
+    a = automation()
+    try:
+        elem = entrada.element.BuildUpdatedCache(a.build_cache_request(a.tree_props()))
+    except Exception:
+        # Elemento morto: e isso que 'disappears' esta esperando acontecer.
+        return None
+    return build_node(
+        elem,
+        ref=ref,
+        depth=0,
+        patterns=_patterns_disponiveis(elem, pattern_availability_props()),
+    )
+
+
+def _janelas_que_casam(ctx: ServerContext, criterios: Criterios) -> list[dict[str, Any]]:
+    """Janelas abertas que batem com os criterios e que a policy permite ver.
+
+    Reusa `casa_no_cliente` montando um Node sintetico: os semanticos de `match`
+    (contains/starts_with/regex) tem de ser os mesmos do uia_find_elements, e
+    reimplementa-los aqui seria duas definicoes de "casa" para o agente decorar.
+    """
+    from .uia.search import casa_no_cliente
+
+    achadas: list[dict[str, Any]] = []
+    for janela in enumerate_windows():
+        if not ctx.policy.window_allowed(janela.process, janela.title):
+            continue
+        no = {
+            "ref": ctx.refs.window_ref(hwnd=janela.hwnd),
+            "type": "Window",
+            "name": janela.title,
+            "cls": janela.process,
+            "st": [],
+            "pat": [],
+        }
+        if casa_no_cliente(no, criterios):
+            achadas.append(no)
+    return achadas
+
+
+def _satisfaz(condition: str, candidatos: list[dict[str, Any]], expected: str | None) -> Any:
+    """O no que satisfaz a condicao, SUMIU, ou None se ainda nao. Spec §8.6."""
+    if condition == "disappears":
+        return SUMIU if not candidatos else None
+    if not candidatos:
+        return None
+    if condition in ("appears", "window_appears"):
+        return candidatos[0]
+    if condition == "enabled":
+        return next((c for c in candidatos if "disabled" not in c["st"]), None)
+    if condition == "focused":
+        return next((c for c in candidatos if "focused" in c["st"]), None)
+
+    alvo = (expected or "").casefold()
+    if condition == "value_equals":
+        return next((c for c in candidatos if str(c.get("val", "")).casefold() == alvo), None)
+    return next((c for c in candidatos if alvo in str(c.get("val", "")).casefold()), None)
+
+
+def _descricao(condition: str, criterios: Criterios, ref: str | None) -> str:
+    """Texto que entra na mensagem do TIMEOUT. Spec §8.6: diz o que se esperava."""
+    if ref:
+        return f"{condition} (ref {ref})"
+    for campo in ("name", "automation_id", "control_type", "class_name", "text_contains"):
+        valor = getattr(criterios, campo)
+        if valor:
+            return f"{condition} ({campo} {criterios.match} {valor!r})"
+    return condition
+
+
+def wait_for_impl(
+    ctx: ServerContext,
+    *,
+    window_ref: str | None,
+    ref: str | None,
+    condition: str,
+    criterios: Criterios,
+    expected: str | None,
+    timeout_ms: int,
+    poll_ms: int,
+) -> dict[str, Any]:
+    """Corpo sincrono de uia_wait_for. Roda na thread do worker."""
+    from .uia.waits import esperar_por
+
+    if condition not in CONDICOES:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            f"Unknown condition {condition!r}. Valid values: {', '.join(CONDICOES)}.",
+            condition=condition,
+        )
+    if condition in CONDICOES_COM_EXPECTED and not expected:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            f"condition={condition!r} requires `expected`.",
+            condition=condition,
+        )
+
+    inicio = time.perf_counter()
+    por_janela = condition == "window_appears"
+
+    # Com `ref` nao ha nada a validar aqui: `_no_do_ref` chama ctx.refs.get na primeira
+    # sondagem, e REF_NOT_FOUND de la propaga na hora — `esperar_por` nao engole
+    # ToolError. Uma checagem adiantada seria codigo que nenhuma sabotagem distingue.
+    if por_janela:
+        criterios.validar()
+    elif not ref:
+        if not window_ref:
+            raise ToolError(
+                Code.INVALID_ARGUMENT,
+                "Either window_ref or ref is required for this condition.",
+                condition=condition,
+                hint=(
+                    "Call uia_list_windows for a window_ref, or use "
+                    "condition='window_appears'."
+                ),
+            )
+        resolver_janela(ctx, window_ref)
+        criterios.validar()
+
+    # Quantos candidatos a ultima sondagem viu. Vai para os details do TIMEOUT: e a
+    # diferenca entre "o elemento nunca apareceu" e "apareceu mas nunca ficou pronto",
+    # que pedem correcoes opostas do agente.
+    ultimos = [0]
+
+    def sondar() -> Any:
+        if por_janela:
+            candidatos = _janelas_que_casam(ctx, criterios)
+        elif ref:
+            no = _no_do_ref(ctx, ref)
+            candidatos = [no] if no is not None else []
+        else:
+            assert window_ref is not None
+            candidatos = buscar_elementos(
+                ctx,
+                window_ref=window_ref,
+                criterios=criterios,
+                only_interactive=False,
+                max_results=5,
+            ).achados
+        ultimos[0] = len(candidatos)
+        return _satisfaz(condition, candidatos, expected)
+
+    try:
+        r = esperar_por(
+            sondar,
+            timeout_ms=timeout_ms,
+            poll_ms=poll_ms,
+            descricao=_descricao(condition, criterios, ref),
+        )
+    except ToolError as exc:
+        if exc.code is Code.TIMEOUT:
+            # Sem isto o agente nao sabe se insiste (estava aparecendo) ou se muda o
+            # criterio (nunca apareceu nada).
+            exc.details["last_seen_candidates"] = ultimos[0]
+            exc.details["window_alive"] = (
+                window_is_alive(ctx.refs.hwnd_for(window_ref)) if window_ref else None
+            )
+        raise
+
+    ctx.audit.log_call(
+        tool="uia_wait_for",
+        result="ok",
+        params={"window_ref": window_ref, "ref": ref, "condition": condition},
+        duration_ms=(time.perf_counter() - inicio) * 1000,
+        read_only=ctx.policy.read_only,
+    )
+
+    return {
+        "ok": True,
+        "condition": condition,
+        "satisfied": True,
+        "waited_ms": round(r.waited_ms, 1),
+        "polls": r.polls,
+        # 'disappears' satisfaz pela AUSENCIA: inventar um elemento aqui seria mentir.
+        "match": None if r.resultado is SUMIU else r.resultado,
+    }
+
+
+@mcp.tool()
+@tool_errors
+async def uia_wait_for(
+    condition: Annotated[
+        str,
+        Field(
+            description=(
+                "appears | disappears | enabled | focused | value_equals | "
+                "value_contains | window_appears"
+            )
+        ),
+    ] = "appears",
+    window_ref: Annotated[
+        str | None, Field(description="Window ref from uia_list_windows.")
+    ] = None,
+    ref: Annotated[
+        str | None, Field(description="Wait on this specific element instead of searching.")
+    ] = None,
+    name: Annotated[str | None, Field(description="Matched according to `match`.")] = None,
+    automation_id: Annotated[str | None, Field(description="Exact, case-sensitive.")] = None,
+    control_type: Annotated[str | None, Field(description="Button, Edit, MenuItem, …")] = None,
+    text_contains: Annotated[str | None, Field(description="Substring of name or value.")] = None,
+    match: Annotated[str, Field(description="exact | contains | starts_with | regex")] = "contains",
+    expected: Annotated[
+        str | None, Field(description="Required for value_equals and value_contains.")
+    ] = None,
+    timeout_ms: Annotated[int, Field(ge=100, le=60000)] = 5000,
+    poll_ms: Annotated[int, Field(ge=50, le=1000)] = 100,
+) -> dict[str, Any]:
+    """Poll until a UI condition holds: an element appears, disappears, becomes enabled, gets
+    focus, its value matches, or a new window opens. Use after an action that triggers async
+    rendering (dialog opening, page loading, list populating) instead of guessing with a
+    fixed sleep."""
+    ctx = context()
+    criterios = Criterios(
+        name=name,
+        automation_id=automation_id,
+        control_type=control_type,
+        text_contains=text_contains,
+        match=match,
+    )
+    return await ctx.worker.run(
+        lambda: wait_for_impl(
+            ctx,
+            window_ref=window_ref,
+            ref=ref,
+            condition=condition,
+            criterios=criterios,
+            expected=expected,
+            timeout_ms=timeout_ms,
+            poll_ms=poll_ms,
         )
     )
