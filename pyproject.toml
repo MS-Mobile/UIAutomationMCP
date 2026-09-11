@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-windows-uia"
+version = "0.1.0"
+description = "MCP server exposing Windows UI Automation to an AI agent"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.2.0",
+  "comtypes>=1.4.16",
+  "psutil>=5.9",
+]
+
+[project.scripts]
+mcp-windows-uia = "mcp_windows_uia.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_windows_uia"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "e2e: exige sessao interativa do Windows desbloqueada",
+]

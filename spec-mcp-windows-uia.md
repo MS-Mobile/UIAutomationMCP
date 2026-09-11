@@ -12,7 +12,7 @@
 | Prefixo das ferramentas | `uia_` |
 | Transporte | stdio (JSON-RPC 2.0) |
 | Plataforma | Windows 10 (1809+) e Windows 11, x64 |
-| Runtime | Python 3.11+ (64-bit) |
+| Runtime | Python 3.14 x64 (piso suportado: 3.11) |
 
 **Convenção de idioma:** este documento é em português. A *superfície de API* (nomes de ferramentas, chaves JSON, códigos e mensagens de erro, descrições das tools expostas via MCP) é em **inglês**, porque é consumida por um LLM e deve seguir a convenção do ecossistema MCP. Não traduza a API.
 
@@ -50,7 +50,7 @@ Dentro do Google Chrome o agente já tem uma experiência qualitativamente super
 │  Claude Desktop      │ ─────────────────────────────► │  mcp-windows-uia (Python)  │
 │  (cliente MCP)       │ ◄───────────────────────────── │                            │
 └──────────────────────┘                                │  ┌──────────────────────┐  │
-                                                        │  │ camada MCP (FastMCP) │  │
+                                                        │  │ camada MCP (MCPServer)│  │
                                                         │  ├──────────────────────┤  │
                                                         │  │ policy: allowlist,   │  │
                                                         │  │ read-only, audit     │  │
@@ -77,10 +77,10 @@ mcp-windows-uia/
 ├─ config.toml                  # allowlist, flags, limites
 ├─ src/mcp_windows_uia/
 │  ├─ __main__.py               # entrypoint, CLI args, DPI awareness, mcp.run(stdio)
-│  ├─ server.py                 # definição das tools (FastMCP)
+│  ├─ server.py                 # definição das tools (MCPServer, mcp>=2.0)
 │  ├─ worker.py                 # UiaWorker: thread STA única + CoInitializeEx
 │  ├─ uia/
-│  │  ├─ core.py                # wrapper do IUIAutomation, CacheRequest, TreeWalker
+│  │  ├─ core.py                # CUIAutomation8/IUIAutomation6, CacheRequest, TreeWalker, condições
 │  │  ├─ tree.py                # captura/filtragem/serialização da árvore
 │  │  ├─ patterns.py            # invoke/toggle/select/expand/value/scroll + fallback
 │  │  ├─ windows.py             # enumeração de top-level windows
@@ -118,38 +118,50 @@ UIA_EXECUTOR = ThreadPoolExecutor(
 )
 ```
 
-Se disponível, instanciar `CUIAutomation8` (Windows 8+) em vez de `CUIAutomation`, e configurar `IUIAutomation6.ConnectionTimeout` / `TransactionTimeout` = 10000 ms. Isso evita travamento quando o app-alvo não bombeia mensagens.
+Instanciar **obrigatoriamente** `CUIAutomation8` (Windows 8+) via `comtypes.client.CreateObject(UIA.CUIAutomation8, interface=UIA.IUIAutomation6)` e configurar `ConnectionTimeout` / `TransactionTimeout` = 10000 ms. Isso evita travamento quando o app-alvo não bombeia mensagens, e é o que torna **CA-23** implementável. Verificado funcionando em 2026-08-19 (§3.1); o `CUIAutomation` legado **não** expõe essas propriedades.
 
 ---
 
 ## 3. Escolha de biblioteca Python
 
-### 3.1 Comparativo
+### 3.1 Evidência empírica (medida em 2026-08-19, Windows 11 26200, Python 3.14.6 x64)
 
-| Critério | `uiautomation` (yinkaisheng) | `pywinauto` (backend `uia`) | `comtypes` direto (UIAutomationCore) |
-|---|---|---|---|
-| Modelo | Wrapper fino sobre COM; classes `Control` por ControlType | Framework alto nível (`Application`, `WindowSpecification`, `.child_window()`) | Sem abstração; `IUIAutomation*` cru |
-| Cobertura de patterns | Alta — todos os patterns UIA expostos (`ValuePattern`, `TogglePattern`, `ExpandCollapsePattern`, `ScrollPattern`, `SelectionItemPattern`, `TextPattern`…) | Média — expõe métodos convenientes, mas esconde patterns menos comuns | Total (é a API) |
-| Acesso a `RuntimeId` | Sim (`control.GetRuntimeId()`) | Indireto (`element_info.runtime_id`) | Sim |
-| `CacheRequest` / `FindAllBuildCache` | Não exposto, mas dá para chegar no `IUIAutomationElement` cru via `control.Element` | Não exposto de forma útil | Sim, controle total |
-| Performance em árvores grandes | Média — 1 chamada COM cross-process por propriedade | Baixa — camada extra + `best_match` custoso | Alta com cache (1 chamada para N propriedades de N elementos) |
-| Boilerplate | Baixo | Muito baixo | Alto (enums, `IUIAutomationCondition`, `TreeWalker`, tratamento de `HRESULT`) |
-| Dependências | `comtypes` | `comtypes` + `pywin32` + `six` + `Pillow` | `comtypes` |
-| Manutenção | Mantenedor único, releases esparsos, docs fracas (mas código legível) | Projeto maduro, docs boas, comunidade maior | N/A (é a API do SO, estável desde Win7) |
-| Riscos | Estado global (`uiautomation.SetGlobalSearchTimeout`), `TIME_OUT_SECOND` implícito de busca | Abstrações "mágicas" (`best_match`) produzem seleção não determinística — conflita com o princípio 4 | Erros de tipagem COM difíceis de depurar; sem rede de segurança |
+A decisão abaixo foi tomada contra medição, não contra reputação. Quatro provas de conceito:
 
-### 3.2 Recomendação
+| Verificação | Resultado |
+|---|---|
+| `comtypes.client.GetModule("UIAutomationCore.dll")` | Gera **626 símbolos** em 142 ms: 175 `*PropertyId`, 41 `*ControlTypeId`, 32 `*PatternId`, 32 `Is*PatternAvailablePropertyId`, todas as `TreeScope_*`/`AutomationElementMode_*`, todas as interfaces `IUIAutomation`…`IUIAutomation6` e o coclass `CUIAutomation8` |
+| `uiautomation` → `QueryInterface(IUIAutomation2..6)` | **Falha em todas.** A lib instancia `CUIAutomation` (legado), logo `ConnectionTimeout`/`TransactionTimeout` exigidos pela §2.2 são inalcançáveis pelo cliente dela |
+| `CreateObject(CUIAutomation8, interface=IUIAutomation6)` via comtypes | OK. `ConnectionTimeout = 10000` e `TransactionTimeout = 10000` aceitos e lidos de volta |
+| `FindAllBuildCache` + `CacheRequest` com 11 propriedades | 27 nós com todas as propriedades cacheadas lidas em ~130 ms, zero RPC adicional por propriedade |
 
-**Usar `uiautomation` como camada base, com escape hatch obrigatório para `comtypes` cru.**
+### 3.2 Saúde das dependências candidatas
+
+| | `uiautomation` (yinkaisheng) | `comtypes` (Enthought) |
+|---|---|---|
+| Mantenedor | 1 pessoa física, projeto de tempo livre | Enthought + 6 mantenedores |
+| Licença | Apache 2.0 | MIT |
+| Último release PyPI | 2.0.29, ago/2025 | 1.4.16, mar/2026 |
+| Cadência | esparsa (2 commits triviais em 10 meses) | ~2 meses |
+| Issues abertas | 154 | 98 |
+| Histórico | 6 releases *yanked* em sequência (2.0.21–2.0.26, abr/2025) | — |
+| Bus factor | **1** | vários |
+
+### 3.3 Decisão: `comtypes` puro, sem `uiautomation`
+
+**A base é `comtypes` + `GetModule("UIAutomationCore.dll")`. `uiautomation` não entra, nem em runtime nem como dependência.**
 
 Justificativa:
 
-1. `uiautomation` é um mapeamento praticamente 1:1 da API UIA — o que a spec descreve em termos de UIA traduz diretamente, sem reinterpretação. Isso reduz ambiguidade de implementação.
-2. Ele expõe o `IUIAutomationElement` subjacente em `control.Element`, permitindo usar `CreateCacheRequest` + `FindAllBuildCache` exatamente onde a performance importa (captura de árvore, §5.2). Ou seja: conveniência onde não custa, COM cru onde custa.
-3. `pywinauto` é rejeitado como base porque seu identificador principal é *best match* textual — inerentemente não determinístico e incompatível com o esquema de refs desta spec. Ele adiciona latência sem adicionar capacidade.
-4. `comtypes` puro é rejeitado como base pelo volume de boilerplate (condições, walkers, enums, tratamento de `HRESULT`), que multiplica a superfície de bugs num projeto onde o valor está na semântica das tools, não na plumbing COM.
+1. **A §2.2 é inegociável e a lib não a atende.** O servidor precisa de `CUIAutomation8` com `ConnectionTimeout`/`TransactionTimeout` para que **CA-23** (app travado → `TIMEOUT` ≤ 15 s) seja implementável. Só o caminho comtypes entrega isso.
+2. **Manter as duas significaria dois clientes COM no mesmo processo** — o do wrapper (sem timeouts) e o nosso (com) — cada um com sua própria visão de cache e seus próprios ponteiros. É uma fonte de bugs sem contrapartida.
+3. **O argumento clássico contra comtypes cru caiu.** O boilerplate temido (enums, IDs de propriedade e de pattern) é **gerado** do typelib: 626 símbolos prontos. O que resta escrever à mão é `TreeWalker`, construção de `IUIAutomationCondition` e mapeamento de `HRESULT` — que é o próprio produto, não plumbing descartável.
+4. **O que o wrapper ofereceria além disso, esta spec já rejeita.** Busca (§8.4) precisa ser determinística; envio de teclas (§8.9) tem sintaxe própria e liberação garantida de modificadores; esperas (§7.3) têm política própria de backoff e settle. A sobreposição útil é quase nula.
+5. `pywinauto` segue rejeitado pelo motivo original: identificador principal é *best match* textual, incompatível com o princípio 4 (determinismo) e com o esquema de refs.
 
-**Regra dura de implementação:** `uia_get_tree` e `uia_find_elements` **devem** usar `FindAllBuildCache` com `CacheRequest` contendo todas as propriedades necessárias e `AutomationElementMode.None` quando só os dados forem usados. Ler propriedade a propriedade em árvore de >100 nós é inaceitável (cada leitura é um RPC cross-process; a diferença é de ~10 s para ~0,3 s).
+**Regra dura de implementação (mantida e reforçada):** `uia_get_tree` e `uia_find_elements` **devem** usar `FindAllBuildCache` com `CacheRequest` contendo todas as propriedades necessárias, e ler exclusivamente as propriedades `Cached*`. Ler propriedade a propriedade (`Current*`) em árvore de >100 nós é inaceitável — cada leitura é um RPC cross-process.
+
+**Consequência para `uia/core.py`:** o módulo passa a ser dono de (a) instanciar `CUIAutomation8`/`IUIAutomation6` com os timeouts, (b) expor os `TreeWalker` de ControlView, (c) fabricar condições (`CreatePropertyCondition`, `CreateAndCondition`, `CreateTrueCondition`), (d) montar `CacheRequest` reutilizáveis, (e) traduzir `COMError.hresult` para os códigos da §9.2. Estimativa: 300–500 linhas.
 
 Dependências fixadas:
 
@@ -158,14 +170,17 @@ Dependências fixadas:
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.2.0",
-  "uiautomation>=2.0.20",
-  "comtypes>=1.4.6",
-  "psutil>=5.9",          # process name/pid confiável
-  "tomli-w>=1.0",         # persistência de config
+  "comtypes>=1.4.16",
+  "psutil>=5.9",          # process name/exe path confiável a partir do pid
 ]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 ```
 
-`psutil` é usado para resolver `pid → process name/exe path` de forma robusta (a UIA fornece só `ProcessId`).
+`psutil` é usado para resolver `pid → process name/exe path` de forma robusta (a UIA fornece só `ProcessId`). `tomli-w` foi removido: a §10.1 estabelece que a config é lida apenas no startup e nunca reescrita em runtime, e `tomllib` (leitura) é stdlib desde 3.11.
+
+**Interpretador de referência: Python 3.14.6 x64** — validado nas provas de conceito acima. O piso declarado continua 3.11 (`tomllib`, sintaxe de tipos), mas o desenvolvimento e os testes de aceitação rodam em 3.14.
 
 ---
 
@@ -174,7 +189,7 @@ dependencies = [
 | Requisito | Detalhe | Consequência se violado |
 |---|---|---|
 | SO | Windows 10 build 17763+ ou Windows 11 | `SetProcessDpiAwarenessContext` indisponível em builds antigas → usar `SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)` |
-| Python | 3.11+ **64-bit** | Python 32-bit consegue falar UIA com processos 64-bit, mas há degradação/limitações em propriedades nativas; exigir 64-bit |
+| Python | 3.14 x64 (piso 3.11) | Python 32-bit consegue falar UIA com processos 64-bit, mas há degradação/limitações em propriedades nativas; exigir 64-bit |
 | Sessão | Sessão interativa desbloqueada, console local | Tela bloqueada ou sessão RDP desconectada → árvore vazia. Retornar `SESSION_UNAVAILABLE` |
 | COM | STA por thread (§2.2) | `RPC_E_WRONG_THREAD`, crashes intermitentes |
 | DPI | Processo **deve** declarar Per-Monitor V2 antes de qualquer chamada UIA/Win32 | `BoundingRectangle` retorna coords virtualizadas; clique de fallback erra o alvo em telas com escala ≠ 100% |
@@ -249,14 +264,58 @@ Regra de redação: se `password ∈ st`, `val` **nunca** é retornado; em seu l
 
 ### 5.2 Captura e cache
 
-`uia_get_tree` executa:
+**Distinção que gera bug se ignorada:** `FindAllBuildCache(escopo_da_busca, condição, cache_request)` tem *dois* escopos independentes. O primeiro argumento diz **quais elementos achar**. O `TreeScope` do `CacheRequest` diz, para **cada elemento achado**, quanto da subárvore *dele* pré-carregar junto. Não são a mesma coisa e não devem receber o mesmo valor.
+
+`CacheRequest.TreeScope` **deve ser `TreeScope_Element`**. Qualquer valor que inclua `Descendants` faz uma busca que casa N elementos pedir N subárvores completas numa única transação COM; ela estoura o `TransactionTimeout` de 10 s (§2.2) e aflora como `E_FAIL` (`0x80004005`).
+
+Medido em 2026-09-10 no WhatsApp Desktop (WebView2, 24409 nós na ControlView), com find=`TreeScope_Subtree` a partir da janela:
+
+| `CacheRequest.TreeScope` | Resultado |
+|---|---|
+| `Element` | OK — 24409 nós em 18,2 s; ler `Cached*` dos 24409 leva **198 ms** |
+| `Children` | OK, porém 22,5 s |
+| `Descendants` | `E_FAIL` após ~13,4 s |
+| `Subtree` | `E_FAIL` após ~13,5 s |
+
+Não é restrição categórica: num elemento folha, `cache=Subtree` funciona. A falha é de volume, e o tempo até falhar coincide com o `TransactionTimeout` que nós mesmos configuramos.
+
+#### Algoritmo obrigatório: captura limitada por nível
+
+A segunda lição da medição é que **uma única busca com find=Subtree é inviável mesmo com o cache correto**: 18,2 s excede o teto de 15 s do `UiaWorker` (§2.2), então `uia_get_tree` devolveria `TIMEOUT` justamente nos apps mais interessantes. E ela paga por 24409 nós para entregar 200 — o orçamento da §6.1 era aplicado *depois* de buscar tudo.
+
+**O orçamento é aplicado durante o percurso, não depois.** `uia_get_tree` executa:
 
 1. Resolve a janela (por `window_ref`, `hwnd` ou `title`).
-2. Cria `CacheRequest` com `TreeScope_Subtree`, propriedades: `Name`, `AutomationId`, `ClassName`, `ControlType`, `IsEnabled`, `IsOffscreen`, `IsKeyboardFocusable`, `HasKeyboardFocus`, `BoundingRectangle`, `RuntimeId`, `ProcessId`, `IsPassword`, `ToggleToggleState`, `ExpandCollapseExpandCollapseState`, `SelectionItemIsSelected`, `ValueValue`, `ValueIsReadOnly`, `RangeValueValue`, e `IsXxxPatternAvailable` para os patterns da tabela.
-3. `AutomationElementMode = Full` (necessário para depois obter patterns) e `TreeFilter = ControlViewCondition` (não `RawView` — RawView infla a árvore com nós irrelevantes).
-4. `FindAllBuildCache` a partir da raiz da janela.
-5. Percorre o resultado **cacheado** (`Cached*` properties — zero RPC adicional), aplica filtro (§6.2) e orçamento (§6.1).
-6. Registra cada nó retornado no `RefStore` e emite a lista plana.
+2. Monta **uma vez** o `CacheRequest`, reusado em todas as chamadas do passo 4:
+   - Propriedades: `Name`, `AutomationId`, `ClassName`, `ControlType`, `IsEnabled`, `IsOffscreen`, `IsKeyboardFocusable`, `HasKeyboardFocus`, `BoundingRectangle`, `RuntimeId`, `ProcessId`, `IsPassword`, `ToggleToggleState`, `ExpandCollapseExpandCollapseState`, `SelectionItemIsSelected`, `ValueValue`, `ValueIsReadOnly`, `RangeValueValue`, e `IsXxxPatternAvailable` para os patterns da tabela da §5.1.
+   - `TreeScope = TreeScope_Element` — regra acima, inegociável.
+   - `TreeFilter = ControlViewCondition` (não `RawView`: infla a árvore com nós irrelevantes).
+   - `AutomationElementMode = Full` (necessário para obter patterns depois).
+3. Inicializa a fila de percurso com a raiz da captura (`root_ref`, ou o elemento da janela).
+4. **Enquanto** houver nós na fila **e** `emitidos < max_nodes` **e** `profundidade < max_depth`:
+   1. Desenfileira o nó e chama `FindAllBuildCache(TreeScope_Children, ControlViewCondition, cache_request)`.
+   2. Lê **apenas** propriedades `Cached*` dos filhos — zero RPC adicional.
+   3. Aplica `max_children_per_node` fatiando o array retornado (sem RPC); anota `"n": <restantes>` no nó pai.
+   4. Aplica o filtro (§6.2) no cliente, sobre as propriedades já cacheadas.
+   5. Enfileira os filhos sobreviventes para o próximo nível.
+5. Registra cada nó emitido no `RefStore` e emite a lista plana.
+
+O percurso é em **largura por níveis, ordem de documento dentro do nível**, como a §6.1 já exige — e agora a §5.2 o implementa em vez de contradizê-lo.
+
+Custo: **uma chamada COM por nó-pai visitado**, cada uma trazendo todos os filhos com todas as propriedades de uma vez. Isso satisfaz a regra dura da §3.3: o que ela proíbe é ler propriedade a propriedade (`Current*`), que custaria ~50 RPCs por nó.
+
+Medido na mesma janela:
+
+| Orçamento | Nós emitidos | Chamadas COM | Tempo |
+|---|---|---|---|
+| `max_nodes=200`, `max_depth=12` | 46 | 44 | **159 ms** |
+| `max_nodes=600`, `max_depth=20` | 287 | 213 | 375 ms |
+| `max_nodes=1500`, `max_depth=40` | 631 | 632 | 721 ms |
+| *(referência)* find=Subtree sem limite | 24409 | 1 | **18205 ms** |
+
+**Armadilha a evitar:** não empurrar o filtro da §6.2 para dentro da condição do `FindAllBuildCache`. O percurso precisa **descer através** de containers que não passam no filtro para alcançar os nós que passam; uma condição nativa restritiva poda o caminho e o conteúdo some. A condição do percurso é sempre a ControlView; o filtro roda no cliente, sobre propriedades já cacheadas, a custo zero. (A otimização por condição nativa da §8.4 é legítima porque lá a busca é *plana* — não precisa atravessar nada.)
+
+**Consequência para `max_depth` (resolvida na §6.1):** o default de 12 foi calibrado para app nativo. Árvores de WebView2/Electron são muito mais fundas — a do WhatsApp tem profundidade real 45, e parar em 12 devolve 46 nós, **nenhum deles conteúdo de conversa**. Por isso o percurso aprofunda sozinho quando para raso sem achar nada: ver §6.1, *Aprofundamento adaptativo*.
 
 ---
 
@@ -267,7 +326,7 @@ Regra de redação: se `password ∈ st`, `val` **nunca** é retornado; em seu l
 | Parâmetro | Default | Máximo | Efeito |
 |---|---|---|---|
 | `max_nodes` | 200 | 1500 | Nº de nós na resposta |
-| `max_depth` | 12 | 40 | Profundidade máxima percorrida |
+| `max_depth` | 12 (adaptativo) | 40 | Profundidade máxima percorrida; aprofunda sozinho se parar raso sem achar nada — ver abaixo |
 | `max_chars` (texto) | 6000 | 40000 | Caracteres de conteúdo textual |
 | `max_children_per_node` | 30 | 500 | Irmãos por container antes de elidir |
 | Name truncation | 120 chars | — | Sufixo `…` |
@@ -288,6 +347,32 @@ Comportamento ao estourar:
 ```
 
 **Regra dura:** o servidor **nunca** retorna árvore não truncada acima de 1500 nós, mesmo com `max_nodes` maior. Ele corta e sinaliza.
+
+
+#### Aprofundamento adaptativo (`max_depth`)
+
+O default de 12 serve app nativo. Árvore de WebView2/Electron é bem mais funda — a do WhatsApp tem profundidade real 45, e parar em 12 devolve 46 nós sem nenhum conteúdo de conversa. Em vez de subir o default e encarecer todo app nativo, o percurso **continua descendo quando parou raso sem achar nada**.
+
+Regra: ao atingir `max_depth` com a fila de percurso **não vazia** e **zero** nós aprovados pelo filtro (§6.2), o percurso não para — segue drenando a fila nível a nível até a primeira das condições:
+
+| Para quando | |
+|---|---|
+| ≥1 nó passa no filtro | achou o que procurava |
+| `max_nodes` atingido | orçamento manda |
+| profundidade 40 | teto duro |
+| fila vazia | acabou a árvore |
+
+**Não é nova captura.** A fila do percurso em largura já está montada; aprofundar é continuar a drenagem. Zero RPC desperdiçado, nada é revisitado.
+
+**Só vale para o default.** Se o chamador passou `max_depth` explicitamente, o valor é respeitado ao pé da letra — o agente pediu profundidade rasa e recebe profundidade rasa.
+
+A resposta declara o que houve, para o agente não achar que a árvore é rasa:
+
+```json
+"stats": {"returned": 631, "visited": 1204, "truncated": false,
+          "auto_deepened": true, "depth_reached": 25, "depth_requested": 12}
+```
+
 
 ### 6.2 Filtros (`filter`)
 
@@ -477,7 +562,7 @@ Notas: `allowed:false` significa que a janela existe mas está fora da allowlist
 | `window_ref` | string | sim¹ | — | Ref de janela de `uia_list_windows` |
 | `root_ref` | string | não | — | Captura a partir deste elemento (¹ dispensa `window_ref`) |
 | `filter` | enum | não | `"interactive"` | `interactive` \| `content` \| `all` \| `landmarks` |
-| `max_depth` | int | não | `12` | 1–40 |
+| `max_depth` | int | não | `12` | 1–40. Omitido, aprofunda sozinho se parar raso sem achar nada (§6.1); informado, e respeitado ao pe da letra |
 | `max_nodes` | int | não | `200` | 1–1500 |
 | `max_children_per_node` | int | não | `30` | 1–500 |
 | `cursor` | string | não | — | Continua captura truncada anterior |
@@ -975,7 +1060,7 @@ from __future__ import annotations
 import argparse, ctypes, logging, sys
 from typing import Annotated, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer  # mcp>=2.0; na 1.x era mcp.server.fastmcp.FastMCP
 from pydantic import Field
 
 # 1) DPI awareness ANTES de qualquer coisa de UI
@@ -992,7 +1077,7 @@ def _init_dpi() -> None:
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-mcp = FastMCP("windows-uia")
+mcp = MCPServer("windows-uia")
 
 
 @mcp.tool()
@@ -1081,7 +1166,7 @@ Arquivo: `%APPDATA%\Claude\claude_desktop_config.json`
 
 Passos de instalação a documentar no README:
 
-1. `py -3.11 -m venv .venv` (Python 64-bit) e `.venv\Scripts\pip install -e .`
+1. `py -3.14 -m venv .venv` (Python 64-bit) e `.venv\Scripts\pip install -e .`
 2. Editar `config.toml`: preencher `[allowlist] processes`.
 3. Smoke test fora do Claude: `.venv\Scripts\python -u -m mcp_windows_uia --config config.toml --read-only` e enviar um `initialize` + `tools/list` por stdin (ou usar `mcp dev`).
 4. Adicionar o bloco acima ao `claude_desktop_config.json` e reiniciar o Claude Desktop **completamente** (encerrar pela bandeja, não só fechar a janela).
