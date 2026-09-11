@@ -76,6 +76,22 @@ def pattern_availability_props() -> dict[str, int]:
     return cache
 
 
+def casavel_em_condicao_nativa(texto: str) -> bool:
+    """O provider consegue casar este texto numa PropertyCondition?
+
+    Nao com caractere fora do BMP. Medido no WhatsApp Desktop (WebView2): de 14
+    DataItems, TODOS os nomes so-BMP casaram (78, 158, 468 resultados) e TODOS os
+    que continham emoji casaram ZERO — sem excecao e sem erro. Acento, nbsp e nomes
+    de 55 caracteres nao atrapalham; um par surrogate em UTF-16 atrapalha.
+
+    Zero silencioso e o pior resultado possivel aqui: `uia_find_elements` diria
+    ELEMENT_NOT_FOUND com exhaustive=True, afirmando com confianca que o elemento
+    nao existe, e o rebind diria STALE_REF. Quando o texto nao passa por esta
+    funcao, a comparacao tem de acontecer em Python.
+    """
+    return all(ord(c) <= 0xFFFF for c in texto)
+
+
 @dataclass(frozen=True, slots=True)
 class Achados:
     """Resultado bruto de uma busca da §8.4.
@@ -212,7 +228,14 @@ class Automation:
             )
             if tipo_id is not None:
                 condicoes.append(self.property_condition(U.UIA_ControlTypePropertyId, tipo_id))
-        if criterios.name and criterios.match == "exact":
+        # Emoji no nome faz a condicao nativa casar zero, em silencio. Sem o nome nas
+        # condicoes, `restringe` cai para False quando ele era o unico criterio e a
+        # busca vai para a varredura, que compara em Python.
+        if (
+            criterios.name
+            and criterios.match == "exact"
+            and casavel_em_condicao_nativa(criterios.name)
+        ):
             condicoes.append(self.property_condition(U.UIA_NamePropertyId, criterios.name))
 
         return self.and_conditions(*condicoes), bool(condicoes)
@@ -253,12 +276,26 @@ class Automation:
         if estrategia is Estrategia.INDEX_PATH:
             return self._por_index_path(self.element_from_handle(hwnd), identity)
 
+        # Estrategia sem material casa o universo: uma condicao
+        # AutomationId=="" devolveu 5000 elementos no WhatsApp Desktop. `rebind` ja
+        # pula estrategias vazias, mas a guarda vale para qualquer outro chamador.
+        if estrategia is Estrategia.AUTOMATION_ID and not identity.automation_id:
+            return []
+        if estrategia is Estrategia.NAME and not identity.name:
+            return []
+
+        nome_nativo = True
         if estrategia is Estrategia.AUTOMATION_ID:
             condicoes = [
                 self.property_condition(U.UIA_AutomationIdPropertyId, identity.automation_id)
             ]
         else:
-            condicoes = [self.property_condition(U.UIA_NamePropertyId, identity.name)]
+            nome_nativo = casavel_em_condicao_nativa(identity.name)
+            condicoes = (
+                [self.property_condition(U.UIA_NamePropertyId, identity.name)]
+                if nome_nativo
+                else []
+            )
             if identity.class_name:
                 condicoes.append(
                     self.property_condition(U.UIA_ClassNamePropertyId, identity.class_name)
@@ -271,7 +308,16 @@ class Automation:
         if tipo_id is not None:
             condicoes.append(self.property_condition(U.UIA_ControlTypePropertyId, tipo_id))
 
-        return self.buscar_plano(hwnd, self.and_conditions(*condicoes)).elementos
+        if not condicoes:
+            # Nome com emoji e nada mais para restringir: um FindAll com TrueCondition
+            # enumeraria a janela inteira. Deixa para o index_path.
+            return []
+
+        candidatos = self.buscar_plano(hwnd, self.and_conditions(*condicoes)).elementos
+        if not nome_nativo:
+            # O provider nao pode filtrar por este nome, entao filtramos aqui.
+            candidatos = [c for c in candidatos if (c.CachedName or "") == identity.name]
+        return candidatos
 
     def _por_index_path(self, raiz: Any, identity: Any) -> list[Any]:
         """Ultimo recurso: desce pelo caminho de indices na ControlView.

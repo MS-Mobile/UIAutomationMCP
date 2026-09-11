@@ -199,3 +199,71 @@ def test_index_path_fora_do_alcance_nao_explode(sta: None) -> None:
 
 def test_index_path_com_findall_que_falha_devolve_vazio(sta: None) -> None:
     assert core.automation()._por_index_path(_ElemQueExplode(), _identity(index_path=(0,))) == []
+
+
+# -------------------------------------- condicao nativa e caracteres fora do BMP
+
+# Sintetico de proposito: o repositorio e publico. A unica propriedade que importa
+# aqui e conter um caractere fora do BMP (par surrogate em UTF-16).
+EMOJI = "Item de teste com emoji 👍"
+
+
+def test_nome_fora_do_bmp_nao_e_casavel_nativamente(sta: None) -> None:
+    """Medido no WhatsApp Desktop: PropertyCondition(Name) com emoji casa ZERO.
+
+    Nomes so-BMP do mesmo provider casam normalmente — 78, 158 e 468 resultados,
+    inclusive com acento e nbsp. Basta um caractere fora do BMP (par surrogate em
+    UTF-16) para a condicao devolver 0 sem erro nenhum.
+    """
+    assert core.casavel_em_condicao_nativa("Salvar como") is True
+    assert core.casavel_em_condicao_nativa("Configurações de exibição 07:22") is True
+    assert core.casavel_em_condicao_nativa(EMOJI) is False
+
+
+def test_name_com_emoji_cai_para_a_varredura_no_cliente(sta: None) -> None:
+    """O ramo nativo mentiria: zero resultados com exhaustive=True.
+
+    `restringe=False` e o que empurra `uia_find_elements` para a varredura, que
+    compara em Python e acha.
+    """
+    from mcp_windows_uia.uia.search import Criterios
+
+    _, restringe = core.automation().condicao_de_criterios(
+        Criterios(name=EMOJI, match="exact")
+    )
+    assert restringe is False
+
+
+def test_name_so_bmp_continua_no_ramo_nativo(sta: None) -> None:
+    from mcp_windows_uia.uia.search import Criterios
+
+    _, restringe = core.automation().condicao_de_criterios(
+        Criterios(name="Salvar", match="exact")
+    )
+    assert restringe is True
+
+
+def test_emoji_no_nome_nao_impede_os_outros_criterios(sta: None) -> None:
+    """control_type continua restringindo; o nome e filtrado depois, no cliente."""
+    from mcp_windows_uia.uia.search import Criterios
+
+    _, restringe = core.automation().condicao_de_criterios(
+        Criterios(name=EMOJI, control_type="Button", match="exact")
+    )
+    assert restringe is True
+
+
+def test_buscar_com_estrategia_sem_material_devolve_vazio(sta: None) -> None:
+    """Uma condicao AutomationId=="" casa o universo: 5000 elementos no WhatsApp.
+
+    `rebind` ja pula estrategias vazias, mas devolver meio app para quem chamar
+    `buscar` direto e um estrago esperando chamador.
+    """
+    from mcp_windows_uia.rebind import Estrategia
+    from mcp_windows_uia.refs import ElementIdentity
+
+    a = core.automation()
+    vazia = ElementIdentity(control_type="Button")
+
+    assert a.buscar(0, vazia, Estrategia.AUTOMATION_ID) == []
+    assert a.buscar(0, vazia, Estrategia.NAME) == []

@@ -62,11 +62,27 @@ def janela_descartavel():
     proc.terminate()
 
 
+async def _ref_do_documento(wref: str) -> str:
+    """Ref da area de texto, esperando a arvore existir.
+
+    Fechar uma janela do Bloco de Notas esvazia por um instante a arvore da OUTRA —
+    e o mesmo processo. Medido: buscar direto passa 2 de 3 vezes, e um teste que as
+    vezes passa nao prova nada. Esperar e para o que a §8.6 existe.
+    """
+    from mcp_windows_uia.server import uia_wait_for
+
+    pronto = await uia_wait_for(
+        window_ref=wref, condition="appears", control_type="Document", timeout_ms=5000
+    )
+    assert pronto["ok"] is True, pronto
+    return pronto["match"]["ref"]
+
+
 async def test_ca06_ref_de_janela_fechada_e_erro_acionavel(  # noqa: F811
     servidor, janela_descartavel
 ) -> None:
     """CA-06: erro classificado, hint que nomeia a tool seguinte, servidor vivo."""
-    from mcp_windows_uia.server import uia_get_value, uia_list_windows, uia_wait_for
+    from mcp_windows_uia.server import uia_get_value, uia_list_windows
 
     wref = servidor.refs.window_ref(hwnd=janela_descartavel.hwnd)
 
@@ -74,11 +90,7 @@ async def test_ca06_ref_de_janela_fechada_e_erro_acionavel(  # noqa: F811
     # ELEMENT_NOT_FOUND com `visited: 0` — medido: passa sozinho e falha na suite
     # inteira, que e o pior tipo de teste. Esperar e literalmente para o que a §8.6
     # existe, entao o teste usa a propria tool.
-    pronto = await uia_wait_for(
-        window_ref=wref, condition="appears", control_type="Document", timeout_ms=5000
-    )
-    assert pronto["ok"] is True, pronto
-    ref = pronto["match"]["ref"]
+    ref = await _ref_do_documento(wref)
 
     ctypes.windll.user32.PostMessageW(janela_descartavel.hwnd, WM_CLOSE, 0, 0)
     for _ in range(50):
@@ -104,12 +116,11 @@ async def test_ca07_rebind_reencontra_o_mesmo_elemento(servidor, notepad) -> Non
     espontaneo dependeria de sorte, e um teste que as vezes nao exercita o rebind e
     um teste que nao prova nada.
     """
-    from mcp_windows_uia.server import uia_find_elements, uia_get_value
+    from mcp_windows_uia.server import uia_get_value
 
     wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    achados = await uia_find_elements(window_ref=wref, control_type="Document")
-    alvo = achados["matches"][0]
-    ref, nome_original = alvo["ref"], alvo["name"]
+    ref = await _ref_do_documento(wref)
+    nome_original = (await uia_get_value(ref=ref))["name"]
 
     antes = await uia_get_value(ref=ref)
     assert antes["rebound"] is False, "sem mexer em nada, o probe tem de acertar"
@@ -134,7 +145,7 @@ async def test_ca07_apos_rebind_a_ref_continua_unica(servidor, notepad) -> None:
     from mcp_windows_uia.server import uia_find_elements, uia_get_value
 
     wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    ref = (await uia_find_elements(window_ref=wref, control_type="Document"))["matches"][0]["ref"]
+    ref = await _ref_do_documento(wref)
 
     servidor.refs.get(ref).runtime_id = (0xDEAD, 0xBEEF)
     await uia_get_value(ref=ref)
@@ -150,10 +161,10 @@ async def test_rebind_nao_e_usado_pelo_wait_for(servidor, notepad) -> None:  # n
     sobre a mesma ref tem de continuar enxergando o elemento como presente pelo estado
     dele, sem nunca dar a condicao por satisfeita.
     """
-    from mcp_windows_uia.server import uia_find_elements, uia_wait_for
+    from mcp_windows_uia.server import uia_wait_for
 
     wref = servidor.refs.window_ref(hwnd=notepad.hwnd)
-    ref = (await uia_find_elements(window_ref=wref, control_type="Document"))["matches"][0]["ref"]
+    ref = await _ref_do_documento(wref)
 
     r = await uia_wait_for(ref=ref, condition="disappears", timeout_ms=400)
 

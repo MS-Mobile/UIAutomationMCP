@@ -3588,6 +3588,50 @@ git commit -m "chore: fecha o plano 2 com as seis tools de leitura verdes"
 
 ---
 
+## Limites conhecidos, medidos no fechamento do plano
+
+A verificação final rodou as seis tools contra o WhatsApp Desktop (WebView2). Três
+bugs saíram corrigidos daí; dois limites ficam registrados porque não têm conserto
+barato e ninguém deve redescobri-los em produção.
+
+**1. Condição nativa não casa nome fora do BMP.** `PropertyCondition(Name)` devolve
+zero, em silêncio, para qualquer nome com emoji — par surrogate em UTF-16. De 14
+`DataItem` medidos, todos os nomes só-BMP casaram (78, 158, 468 resultados) e todos
+os com emoji casaram zero. Acento, nbsp e nomes de 55 caracteres não atrapalham.
+Corrigido: `casavel_em_condicao_nativa` desvia esses nomes para a comparação em
+Python, tanto em `uia_find_elements` quanto no rebind. Sem isso a tool afirmava
+`ELEMENT_NOT_FOUND` com `exhaustive=true` — mentira confiante, o pior modo de falha
+segundo o princípio 3 da spec.
+
+**2. Rebind não desambigua em apps WebView2.** A árvore do WhatsApp repete o mesmo
+`Name` em dezenas de elementos: 79 candidatos com nome idêntico, 468 com "Conversa
+fixada". Com `automation_id` vazio (a web não expõe) e sem `index_path` confiável,
+sobra só o nome, e `rebind` corretamente recusa escolher — `AMBIGUOUS_MATCH` com a
+contagem. É o comportamento certo, mas significa que **a ref de um elemento de
+WebView2 não sobrevive a um re-render**. Resolver isso pede material de identidade
+mais forte (caminho real de ancestrais, posição relativa dentro do container), que é
+projeto próprio e não cabia aqui.
+
+**3. O `index_path` que a captura gravava era um índice plano.** `uia_get_tree`
+registrava `index_path=(indice,)` com a posição do nó na lista da travessia em
+largura, e `rebind` trata `index_path` como caminho de filhos a descer da raiz.
+Duas semânticas diferentes com o mesmo nome: o rebind desceria até um elemento
+qualquer e o devolveria com confiança. Removido — sem material é melhor que com
+material errado.
+
+**4. Janela oculta ou minimizada colapsa o provider de UIA.** Vale para o WhatsApp
+na bandeja (12 nós, todos vazios) e para o Bloco de Notas minimizado (árvore vazia,
+3 execuções de 3). Fora da tela a janela continua `SHOWN` para o sistema e o
+provider fica de pé, que é como a suíte e2e tira a janela de teste da frente de quem
+está usando o PC.
+
+**5. A janela existe antes da árvore de UIA dela.** Buscar logo depois de abrir — ou
+logo depois de fechar outra janela do mesmo processo — devolve `ELEMENT_NOT_FOUND`
+com `visited: 0`. Os testes e2e usam `uia_wait_for` para isso, que é literalmente
+para o que a §8.6 existe.
+
+---
+
 ## O que este plano deliberadamente NÃO faz
 
 - **Paginação por cursor completa (CA-08).** `stats.next_cursor` é emitido como `None`. `budget.py` já tem `encode_cursor`/`decode_cursor` testados; ligar o cursor ao estado de `fila_restante` do percurso é trabalho de meia hora que depende de a captura estar estável primeiro. O teste do CA-08 já aceita ambos os caminhos.

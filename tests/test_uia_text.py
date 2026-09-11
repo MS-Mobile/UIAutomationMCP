@@ -173,3 +173,26 @@ def test_teto_de_profundidade_marca_truncado() -> None:
 def test_dentro_do_orcamento_nao_marca_truncado() -> None:
     raiz = NoFalso(filhos=[NoFalso("a"), NoFalso("b")])
     assert extrair(raiz, LeitorFalso()).truncado is False
+
+
+# ------------------------------------------------- marcador de objeto embutido
+
+
+def test_placeholder_de_objeto_sozinho_nao_vira_bloco() -> None:
+    """\ufffc e OBJECT REPLACEMENT CHARACTER: marca imagem embutida, nao texto.
+
+    Medido no WhatsApp Desktop: 52 dos 376 blocos eram so isso, em sequencia. Para o
+    agente, "￼" nao diz nada — e ainda dispara o alarme de bloco duplicado.
+    """
+    raiz = NoFalso(filhos=[NoFalso("\ufffc"), NoFalso("conteudo")])
+    assert texto_de(raiz) == "conteudo"
+
+
+def test_placeholder_misturado_com_texto_some_so_ele() -> None:
+    raiz = NoFalso(filhos=[NoFalso("\ufffc Foto \ufffc")])
+    assert texto_de(raiz) == "Foto"
+
+
+def test_placeholder_tambem_sai_do_texto_de_pattern() -> None:
+    raiz = NoFalso(filhos=[NoFalso("doc", pattern="\ufffc")])
+    assert texto_de(raiz) == "doc"

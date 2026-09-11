@@ -84,3 +84,22 @@ def test_value_type_reflete_a_fonte() -> None:
     assert tipo_de_valor("SelectionPattern") == "selection"
     assert tipo_de_valor("ValuePattern") == "string"
     assert tipo_de_valor("redacted") == "string"
+
+
+def test_legacy_vazio_nao_esconde_o_name() -> None:
+    """Medido no WhatsApp: DataItem com LegacyIAccessible disponivel e valor "".
+
+    A regra ""-e-valor existe para o ValuePattern, onde um campo de texto pode estar
+    legitimamente vazio. O LegacyIAccessible e outra coisa: quase todo elemento o
+    expoe, e "" e o default de quem nao tem valor MSAA. Aceitar esse "" faz a cadeia
+    parar nele e devolver vazio para uma conversa inteira que estava no Name.
+    """
+    f = FonteFalsa(LegacyIAccessible="", Name="Grupo salao do Reino (2) Ontem")
+    valor, fonte = ler_valor(f, is_password=False)
+    assert valor == "Grupo salao do Reino (2) Ontem"
+    assert fonte == "Name"
+
+
+def test_legacy_com_valor_de_verdade_continua_vencendo_o_name() -> None:
+    f = FonteFalsa(LegacyIAccessible="12,5", Name="Visor")
+    assert ler_valor(f, is_password=False) == ("12,5", "LegacyIAccessible")

@@ -26,6 +26,17 @@ from typing import Any, Protocol
 MAX_NOS = 3000
 MAX_PROFUNDIDADE = 40
 
+# U+FFFC OBJECT REPLACEMENT CHARACTER: o que a arvore de acessibilidade poe no lugar
+# de uma imagem, um anexo, um avatar. Nao e texto. Medido no WhatsApp Desktop: 52 dos
+# 376 blocos eram so isso, em sequencia — ruido para o agente e alarme falso de
+# conteudo duplicado.
+PLACEHOLDER_DE_OBJETO = "￼"
+
+
+def _limpar(texto: str) -> str:
+    """Tira marcadores de objeto embutido e espaco em volta."""
+    return texto.replace(PLACEHOLDER_DE_OBJETO, " ").strip()
+
 
 @dataclass(frozen=True, slots=True)
 class LeituraDeNo:
@@ -84,12 +95,12 @@ def extrair(
 
         # Provider que anuncia TextPattern e devolve "" existe: nesse caso o pattern
         # nao cobriu nada, e apagar a subarvore perderia o conteudo de verdade.
-        do_pattern = (leitura.texto_de_pattern or "").strip()
+        do_pattern = _limpar(leitura.texto_de_pattern or "")
         if do_pattern:
             r.blocos.append(Bloco(do_pattern, leitura.ref, leitura.offscreen))
             continue
 
-        proprio = leitura.texto_proprio.strip()
+        proprio = _limpar(leitura.texto_proprio)
         if proprio and proprio != ancestral:
             r.blocos.append(Bloco(proprio, leitura.ref, leitura.offscreen))
             ancestral = proprio

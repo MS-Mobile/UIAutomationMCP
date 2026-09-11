@@ -307,12 +307,19 @@ def get_tree_impl(
     else:
         versao, pular = _retomar_do_cursor(ctx, window_ref, cursor)
 
-    def registrar(elem: Any, indice: int) -> str:
+    def registrar(elem: Any, _indice: int) -> str:
         """Registra o elemento no RefStore e devolve a ref estavel.
 
         Chamado tambem para os nos PULADOS de uma pagina de continuacao. E de
         proposito: RefStore.put deduplica por (hwnd, runtime_id) e devolve a ref ja
         existente, entao as refs ficam estaveis entre paginas e o store nao cresce.
+
+        NAO grava `index_path`. O indice que chega aqui e a posicao do no na lista
+        PLANA da captura em largura, e o rebind trata index_path como caminho de
+        filhos a descer a partir da raiz — duas coisas diferentes com o mesmo nome.
+        Gravar o indice plano faria o rebind descer ate um elemento qualquer e
+        devolve-lo com confianca; so a conferencia de ControlType da §7.2 evitaria
+        parte dos casos. Sem material e melhor que com material errado.
         """
         return ctx.refs.put(
             elem,
@@ -324,7 +331,6 @@ def get_tree_impl(
                 control_type=control_type_name(_cached(elem, "CachedControlType", 0)),
                 name=_cached(elem, "CachedName", "") or "",
                 class_name=_cached(elem, "CachedClassName", "") or "",
-                index_path=(indice,),
             ),
             tree_version=versao,
         )

@@ -27,6 +27,16 @@ ORDEM_DE_LEITURA = (
 
 _TOGGLE_VAL = {0: "off", 1: "on", 2: "indeterminate"}
 
+# Fontes em que "" significa AUSENCIA, e nao campo legitimamente vazio.
+#
+# O LegacyIAccessible e um adaptador de MSAA que quase todo elemento expoe, e ele
+# devolve "" para qualquer coisa sem valor MSAA — e o default, nao um dado. Medido
+# no WhatsApp Desktop: os DataItems de conversa expoem LegacyIAccessible com valor
+# "", e a cadeia parava nele e devolvia vazio, escondendo o Name, que tinha a
+# conversa inteira. O ValuePattern NAO entra aqui: la um "" e um campo de texto de
+# verdade que esta vazio, e cair dele para o Name devolveria o rotulo do campo.
+VAZIO_E_AUSENCIA = frozenset({"LegacyIAccessible"})
+
 # `value_type` da §8.5: diz ao agente como interpretar `value` sem ele ter de
 # adivinhar pelo tipo JSON. "off" de um toggle e uma string como qualquer outra.
 TIPO_DA_FONTE: dict[str, str] = {
@@ -61,6 +71,8 @@ def ler_valor(fonte: Any, *, is_password: bool) -> tuple[Any, str]:
         # Só None e ausencia: "" de um campo legitimamente vazio e um valor, e cair
         # dele para o Name devolveria o rotulo do campo como se fosse o conteudo.
         if valor is None:
+            continue
+        if valor == "" and nome in VAZIO_E_AUSENCIA:
             continue
         if nome == "TogglePattern":
             return _TOGGLE_VAL.get(valor, str(valor)), nome
