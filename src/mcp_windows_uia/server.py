@@ -17,7 +17,7 @@ import functools
 import logging
 import time
 from collections.abc import Callable
-from typing import Annotated, Any
+from typing import Annotated, Any, NamedTuple
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
@@ -446,15 +446,28 @@ def _trilha_ancestral(automation: Any, elem: Any, *, proprio: str, niveis: int =
     return " > ".join(reversed(trilha))
 
 
-def find_elements_impl(
+class Busca(NamedTuple):
+    """Resultado cru de uma busca: sem auditoria e sem erro quando nada casa."""
+
+    achados: list[dict[str, Any]]
+    janela: WindowInfo
+    visitados: int
+    exaustiva: bool
+
+
+def buscar_elementos(
     ctx: ServerContext,
     *,
     window_ref: str,
     criterios: Criterios,
     only_interactive: bool,
     max_results: int,
-) -> dict[str, Any]:
-    """Corpo sincrono de uia_find_elements. Roda na thread do worker.
+) -> Busca:
+    """Nucleo da busca da §8.4, sem auditoria e sem levantar ELEMENT_NOT_FOUND.
+
+    Separado de `find_elements_impl` porque o `uia_wait_for` sonda isto dezenas de
+    vezes dentro de UMA chamada do agente: auditar cada sondagem encheria o JSONL de
+    `not_found` e faria o registro mentir sobre quantas chamadas houve.
 
     Duas estrategias, escolhidas pelo que os criterios permitem (§8.4):
 
@@ -475,7 +488,6 @@ def find_elements_impl(
     from .uia.search import casa_no_cliente
     from .uia.tree import _patterns_disponiveis
 
-    inicio = time.perf_counter()
     criterios.validar()
 
     janela = resolver_janela(ctx, window_ref)
@@ -550,6 +562,26 @@ def find_elements_impl(
         node.pop("d", None)
         achados.append(node)
 
+    return Busca(achados, janela, bruto.visitados, exaustiva)
+
+
+def find_elements_impl(
+    ctx: ServerContext,
+    *,
+    window_ref: str,
+    criterios: Criterios,
+    only_interactive: bool,
+    max_results: int,
+) -> dict[str, Any]:
+    """Corpo sincrono de uia_find_elements: busca + auditoria + erro. Spec §8.4."""
+    inicio = time.perf_counter()
+    achados, janela, visitados, exaustiva = buscar_elementos(
+        ctx,
+        window_ref=window_ref,
+        criterios=criterios,
+        only_interactive=only_interactive,
+        max_results=max_results,
+    )
     duracao = (time.perf_counter() - inicio) * 1000
 
     if not achados:
@@ -563,7 +595,7 @@ def find_elements_impl(
             Code.ELEMENT_NOT_FOUND,
             "No element matched the given criteria in this window.",
             window_ref=window_ref,
-            visited=bruto.visitados,
+            visited=visitados,
             exhaustive=exaustiva,
         )
 
@@ -583,7 +615,7 @@ def find_elements_impl(
             "returned": len(achados),
             # No ramo nativo isto e o numero de candidatos que o provider devolveu,
             # nao de nos que ele varreu — quem varreu foi ele, e nao conta.
-            "visited": bruto.visitados,
+            "visited": visitados,
             "exhaustive": exaustiva,
         },
     }

@@ -35,19 +35,28 @@ def _janelas_do_bloco_de_notas() -> dict[int, object]:
     }
 
 
-def _minimizar(hwnd: int) -> None:
-    """Tira a janela de teste da frente de quem esta usando o PC.
+def _tirar_da_frente(hwnd: int) -> None:
+    """Move a janela de teste para fora da tela de quem esta usando o PC.
 
     Nao da para abri-la em outra area de trabalho virtual: a API publica
     `IVirtualDesktopManager::MoveWindowToDesktop` so aceita janelas do proprio
-    processo e devolve E_ACCESSDENIED para as de terceiros. Minimizar resolve o
-    mesmo problema sem custo: medido nesta maquina, a mesma janela devolve 46 nos
-    e os mesmos 4 `offscreen` normal, minimizada e fora da tela — o UIA le do
-    provider, nao do que esta pintado.
+    processo e devolve E_ACCESSDENIED para as de terceiros.
+
+    MINIMIZAR NAO SERVE, e a medida que dizia o contrario estava errada. Uma sonda
+    isolada mostrou 46 nos com a janela minimizada, mas ela minimizava uma janela ja
+    renderizada e lia no mesmo instante. Na suite inteira o resultado e outro e
+    deterministico: 3 execucoes de 3 falharam com minimizacao (arvore vazia,
+    `visited: 0`) e 3 de 3 passaram sem ela. O Bloco de Notas do Windows 11 e app
+    empacotado e o provider de UIA colapsa quando ele fica minimizado — o mesmo
+    efeito ja observado nas janelas UWP que devolvem 1 no.
+
+    Fora da tela a janela continua SHOWN para o sistema, entao o provider fica de pe:
+    3 de 3 execucoes verdes.
     """
     import ctypes
 
-    ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+    # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    ctypes.windll.user32.SetWindowPos(hwnd, 0, -32000, -32000, 0, 0, 0x0001 | 0x0004 | 0x0010)
 
 
 @pytest.fixture(scope="session")
@@ -77,7 +86,7 @@ def bloco_de_notas(sta):
         proc.terminate()
         pytest.skip("Bloco de Notas nao abriu a tempo")
 
-    _minimizar(janela.hwnd)
+    _tirar_da_frente(janela.hwnd)
 
     yield janela
 
