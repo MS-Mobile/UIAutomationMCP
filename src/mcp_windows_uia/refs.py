@@ -1,8 +1,12 @@
 """RefStore: refs opacas e estaveis para janelas e elementos. Spec §7.1 e §7.2.
 
-O rebind (re-resolucao por AutomationId / Name / index_path quando o RuntimeId morre)
-NAO vive aqui: precisa de busca na arvore UIA e chega no Plano 2. Este modulo e puro —
-guarda, expira, invalida, e nunca desreferencia o ponteiro COM que carrega.
+O algoritmo de rebind (re-resolucao por AutomationId / Name / index_path quando o
+RuntimeId morre) NAO vive aqui: mora em `rebind.py`, recebendo ElementIdentity, para
+que a camada futura de seletores por app o reuse sem um RefStore por perto.
+
+`resolve` chama esse algoritmo, entao este modulo desreferencia o ponteiro COM em
+exatamente um lugar: o probe de RuntimeId. Tudo o mais continua puro, e a UIA chega
+injetada — nada de `import comtypes` aqui.
 
 Dedup por (hwnd, runtime_id) e obrigatorio: sem ele, cada uia_get_tree criaria refs
 novas para os mesmos elementos e o LRU giraria a toa, invalidando refs que o agente
@@ -198,6 +202,51 @@ class RefStore:
         entrada.last_ok_at = agora
         self._entries.move_to_end(ref)
         return entrada
+
+    def resolve(self, ref: str, *, automation: Any) -> tuple[Any, bool]:
+        """Ref -> (elemento utilizavel, rebound). Spec §7.2.
+
+        `automation` e injetado para o store continuar sem importar COM: quem sabe
+        falar com a UIA e a camada de cima. `rebound=True` diz ao agente que a arvore
+        mudou sob os pes dele — a ref valeu, mas o elemento por tras e outro objeto.
+
+        NAO verifica se a janela morreu: quem chama ja passou por `resolver_janela`,
+        que levanta WINDOW_CLOSED e invalida as refs em lote. Repetir a checagem aqui
+        seria uma segunda definicao de "janela viva" para manter em sincronia.
+        """
+        from .rebind import rebind
+
+        entrada = self.get(ref)  # trata REF_NOT_FOUND e TTL
+
+        # Probe: um RPC so, e o resultado dele ja e a comparacao que interessa.
+        # Elemento morto levanta UIA_E_ELEMENTNOTAVAILABLE aqui.
+        try:
+            if tuple(entrada.element.GetRuntimeId()) == entrada.runtime_id:
+                return entrada.element, False
+        except Exception:
+            pass
+
+        elemento, _estrategia = rebind(automation, hwnd=entrada.hwnd, identity=entrada.identity)
+        self._reapontar(entrada, elemento, tuple(automation.runtime_id_of(elemento)))
+        return elemento, True
+
+    def _reapontar(self, entrada: RefEntry, elemento: Any, runtime_id: tuple[int, ...]) -> None:
+        """Troca o elemento de uma entrada e REINDEXA por (hwnd, runtime_id).
+
+        Sem a reindexacao o dedup do `put` deixa de reconhecer esta entrada e a
+        proxima captura cunha uma ref NOVA para o mesmo elemento — o agente fica com
+        duas refs para uma coisa so. E a chave velha nunca sai, entao um elemento que
+        herdasse aquele runtime_id reciclado pegaria carona numa ref morta.
+
+        Se o alvo do rebind ja tiver ref propria, o indice passa a apontar para esta.
+        A outra continua funcionando pelo ponteiro que guarda; so perde a preferencia
+        no dedup.
+        """
+        self._by_runtime.pop((entrada.hwnd, entrada.runtime_id), None)
+        entrada.element = elemento
+        entrada.runtime_id = runtime_id
+        self._by_runtime[(entrada.hwnd, runtime_id)] = entrada.ref
+        self.touch(entrada)
 
     def touch(self, entry: RefEntry) -> None:
         entry.last_ok_at = self._clock()

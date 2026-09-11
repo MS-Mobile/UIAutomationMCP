@@ -124,3 +124,78 @@ def test_runtime_id_of_devolve_tupla(sta: None) -> None:
     a = core.automation()
     rid = a.runtime_id_of(a.root)
     assert isinstance(rid, tuple) and len(rid) >= 1
+
+
+# --------------------------------------------------- rebind por caminho de indices
+
+
+class _FilhosFalsos:
+    def __init__(self, elems) -> None:
+        self._elems = list(elems)
+
+    @property
+    def Length(self):  # noqa: N802 - assinatura do COM
+        return len(self._elems)
+
+    def GetElement(self, i):  # noqa: N802 - assinatura do COM
+        return self._elems[i]
+
+
+class _ElemFalso:
+    """Duble de IUIAutomationElement com filhos fixos."""
+
+    def __init__(self, tipo: int = 50000, filhos=()) -> None:
+        self.CurrentControlType = tipo
+        self._filhos = list(filhos)
+
+    def FindAll(self, _escopo, _condicao):  # noqa: N802 - assinatura do COM
+        return _FilhosFalsos(self._filhos)
+
+
+class _ElemQueExplode:
+    CurrentControlType = 50000
+
+    def FindAll(self, _escopo, _condicao):  # noqa: N802 - assinatura do COM
+        raise RuntimeError("provider recusou")
+
+
+def _identity(**kw):
+    from mcp_windows_uia.refs import ElementIdentity
+
+    return ElementIdentity(**kw)
+
+
+def test_index_path_desce_ate_o_elemento(sta: None) -> None:
+    alvo = _ElemFalso(50000)  # Button
+    raiz = _ElemFalso(50032, [_ElemFalso(50033), _ElemFalso(50033, [_ElemFalso(), alvo])])
+
+    achados = core.automation()._por_index_path(
+        raiz, _identity(control_type="Button", index_path=(1, 1))
+    )
+
+    assert achados == [alvo]
+
+
+def test_index_path_com_tipo_diferente_nao_devolve_nada(sta: None) -> None:
+    """A pista mais fraca das tres: um controle inserido antes do alvo desloca tudo.
+
+    Sem conferir o ControlType no fim, o rebind devolveria com confianca o elemento
+    errado — que e pior que nao achar, porque o agente age nele.
+    """
+    raiz = _ElemFalso(50032, [_ElemFalso(50004)])  # Edit onde se esperava Button
+
+    achados = core.automation()._por_index_path(
+        raiz, _identity(control_type="Button", index_path=(0,))
+    )
+
+    assert achados == []
+
+
+def test_index_path_fora_do_alcance_nao_explode(sta: None) -> None:
+    raiz = _ElemFalso(50032, [_ElemFalso()])
+
+    assert core.automation()._por_index_path(raiz, _identity(index_path=(5,))) == []
+
+
+def test_index_path_com_findall_que_falha_devolve_vazio(sta: None) -> None:
+    assert core.automation()._por_index_path(_ElemQueExplode(), _identity(index_path=(0,))) == []

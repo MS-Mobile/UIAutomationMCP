@@ -239,6 +239,63 @@ class Automation:
             exhaustive=total <= teto,
         )
 
+    def buscar(self, hwnd: int, identity: Any, estrategia: Any) -> list[Any]:
+        """Candidatos para uma estrategia de rebind. Spec §7.2 passo 5.
+
+        Devolve LISTA, e nao `Achados`: quem decide sobre ambiguidade e o `rebind`,
+        que conta os candidatos e recusa escolher quando ha mais de um (principio 4
+        da spec). Passar o Achados inteiro faria `len()` valer 3 sempre — o numero de
+        campos da tupla.
+        """
+        from ..rebind import Estrategia
+
+        U = self.UIA
+        if estrategia is Estrategia.INDEX_PATH:
+            return self._por_index_path(self.element_from_handle(hwnd), identity)
+
+        if estrategia is Estrategia.AUTOMATION_ID:
+            condicoes = [
+                self.property_condition(U.UIA_AutomationIdPropertyId, identity.automation_id)
+            ]
+        else:
+            condicoes = [self.property_condition(U.UIA_NamePropertyId, identity.name)]
+            if identity.class_name:
+                condicoes.append(
+                    self.property_condition(U.UIA_ClassNamePropertyId, identity.class_name)
+                )
+
+        tipo_id = next(
+            (cid for cid, nome in control_type_names().items() if nome == identity.control_type),
+            None,
+        )
+        if tipo_id is not None:
+            condicoes.append(self.property_condition(U.UIA_ControlTypePropertyId, tipo_id))
+
+        return self.buscar_plano(hwnd, self.and_conditions(*condicoes)).elementos
+
+    def _por_index_path(self, raiz: Any, identity: Any) -> list[Any]:
+        """Ultimo recurso: desce pelo caminho de indices na ControlView.
+
+        Confere o ControlType no fim de proposito. O caminho de indices e a pista mais
+        fraca das tres: sem essa conferencia, um botao inserido antes do alvo faria o
+        rebind devolver com confianca o elemento errado — pior que nao achar.
+        """
+        atual = raiz
+        for indice in identity.index_path:
+            try:
+                filhos = atual.FindAll(self.UIA.TreeScope_Children, self.true_condition)
+            except Exception:
+                return []
+            if indice >= filhos.Length:
+                return []
+            atual = filhos.GetElement(indice)
+
+        if identity.control_type and control_type_name(atual.CurrentControlType) != (
+            identity.control_type
+        ):
+            return []
+        return [atual]
+
     def varrer_descendentes(
         self,
         hwnd: int,

@@ -747,7 +747,9 @@ def get_value_impl(ctx: ServerContext, *, ref: str, max_chars: int) -> dict[str,
     entrada = ctx.refs.get(ref)
     janela = resolver_janela(ctx, entrada.window_ref)
     a = automation()
-    elemento = _snapshot_atualizado(a, entrada.element)
+    # §7.2: probe barato e, se o elemento morreu, reencontra pela identidade.
+    vivo, rebound = ctx.refs.resolve(ref, automation=a)
+    elemento = _snapshot_atualizado(a, vivo)
 
     # Sem try/except: num elemento morto isto levanta UIA_E_ELEMENTNOTAVAILABLE e o
     # worker converte para STALE_REF, que e a resposta acionavel. Engolir a excecao
@@ -781,7 +783,7 @@ def get_value_impl(ctx: ServerContext, *, ref: str, max_chars: int) -> dict[str,
     resposta: dict[str, Any] = {
         "ok": True,
         "ref": ref,
-        "rebound": False,
+        "rebound": rebound,
         "type": control_type_name(_cached(elemento, "CachedControlType", 0)),
         "name": truncate_name(_cached(elemento, "CachedName", "") or ""),
         "value": valor,
@@ -934,12 +936,12 @@ def get_text_impl(
     cr = a.build_cache_request(a.tree_props())
 
     # Sem try/except: elemento morto tem de virar STALE_REF, e nao uma extracao vazia
-    # que o agente leria como "a janela nao tem texto".
-    raiz = (
-        entrada.element.BuildUpdatedCache(cr)
-        if entrada is not None
-        else a.element_from_handle_build_cache(janela.hwnd, cr)
-    )
+    # que o agente leria como "a janela nao tem texto". `resolve` tenta o rebind antes
+    # de desistir, entao um root_ref sobrevive a um re-render entre duas paginas.
+    if root_ref:
+        raiz = ctx.refs.resolve(root_ref, automation=a)[0].BuildUpdatedCache(cr)
+    else:
+        raiz = a.element_from_handle_build_cache(janela.hwnd, cr)
 
     versao = ctx.refs.tree_version(window_ref)
     alvo = window_ref
@@ -1057,6 +1059,11 @@ def _no_do_ref(ctx: ServerContext, ref: str) -> dict[str, Any] | None:
     E aqui que a ref e validada. `ctx.refs.get` fica FORA do try de proposito: ref que
     nunca existiu e um fato, e vira REF_NOT_FOUND na primeira sondagem; elemento que
     morreu e uma condicao, e vira None — que e o que 'disappears' espera.
+
+    NAO usa `ctx.refs.resolve`, ao contrario das outras tools que recebem ref. Rebind
+    reencontra o elemento pela identidade, entao 'disappears' nunca terminaria: a cada
+    sondagem ele acharia um substituto e relataria presenca. Aqui o ponteiro morto e o
+    sinal que se espera, nao um problema a consertar.
     """
     from .uia.core import automation, pattern_availability_props
     from .uia.nodes import build_node

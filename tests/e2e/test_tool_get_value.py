@@ -127,6 +127,11 @@ class ElementoDeSenha:
     def BuildUpdatedCache(self, _cr):  # noqa: N802 - assinatura do COM
         return self
 
+    def GetRuntimeId(self):  # noqa: N802 - assinatura do COM
+        # O mesmo com que foi registrado: assim o probe da §7.2 acerta e o duble nao
+        # passa pelo rebind, que procuraria um PasswordBox no Bloco de Notas real.
+        return (7, 7, 7, 7)
+
     def GetCachedPropertyValue(self, _prop_id):  # noqa: N802 - assinatura do COM
         return 0
 
