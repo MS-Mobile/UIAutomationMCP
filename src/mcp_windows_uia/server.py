@@ -41,7 +41,8 @@ PARAMS_AUDITAVEIS = frozenset(
     {
         "window_ref", "ref", "filter", "max_depth", "max_nodes",
         "max_children_per_node", "verbose", "cursor", "timeout_ms",
-        "only_interactive", "max_results", "max_chars", "state", "scope", "mode", "method",
+        "only_interactive", "max_results", "max_chars", "offset", "include_refs",
+        "root_ref", "state", "scope", "mode", "method",
     }
 )
 
@@ -778,3 +779,219 @@ async def uia_get_value(
     toggle state of a checkbox, selection of a combo box, range value of a slider."""
     ctx = context()
     return await ctx.worker.run(lambda: get_value_impl(ctx, ref=ref, max_chars=max_chars))
+
+
+# --------------------------------------------------------------------------- 8.3
+
+
+class LeitorCOM:
+    """Traduz um IUIAutomationElement na LeituraDeNo da §8.3.
+
+    Concentra todo o COM da extracao num lugar so, para que o percurso de
+    `uia/text.py` — que e onde mora a logica de ordem e de deduplicacao — continue
+    testavel sem Windows.
+
+    `register` e injetado e so existe quando include_refs=True: cunhar uma ref para
+    cada bloco de texto encheria o RefStore de nos que o agente nunca vai citar.
+    """
+
+    def __init__(
+        self,
+        automation: Any,
+        cache_request: Any,
+        props_de_pattern: dict[str, int],
+        *,
+        register: Any = None,
+    ) -> None:
+        from .uia.tree import filhos_cacheados
+
+        self._a = automation
+        self._props = props_de_pattern
+        self._filhos = filhos_cacheados(automation, cache_request)
+        self._register = register
+
+    def filhos(self, no: Any) -> Any:
+        return self._filhos(no, 0)
+
+    def ler(self, no: Any) -> Any:
+        from .uia.nodes import REDACTED, states_of
+        from .uia.text import LeituraDeNo
+        from .uia.tree import _patterns_disponiveis
+
+        patterns = _patterns_disponiveis(no, self._props)
+        st = states_of(no, patterns)
+        senha = "password" in st
+
+        return LeituraDeNo(
+            texto_de_pattern=None if senha else self._texto_de_pattern(no, patterns),
+            texto_proprio=REDACTED if senha else self._texto_proprio(no, st, patterns),
+            ref=self._register(no) if self._register is not None else "",
+            offscreen="offscreen" in st,
+        )
+
+    def _texto_de_pattern(self, no: Any, patterns: list[str]) -> str | None:
+        """DocumentRange.GetText do proprio no, que ja cobre a subarvore dele.
+
+        O limite e o teto duro, NAO o max_chars do chamador: `offset` pagina sobre
+        um documento que precisa ser o mesmo em toda chamada. Cortar a fonte pelo
+        tamanho da pagina faria max_chars=5 paginar sobre um texto de 5 caracteres.
+        E constante de modulo, e nao parametro, justamente para que nao haja por
+        onde o max_chars entrar aqui.
+        """
+        from .budget import HARD_MAX_CHARS
+
+        if "Text" not in patterns:
+            return None
+        limite = HARD_MAX_CHARS
+        UIA = self._a.UIA
+        try:
+            p = no.GetCurrentPattern(UIA.UIA_TextPatternId)
+            if not p:
+                return None
+            return p.QueryInterface(UIA.IUIAutomationTextPattern).DocumentRange.GetText(limite)
+        except Exception:
+            # Pattern anunciado mas nao implementado: desce pelos filhos.
+            return None
+
+    @staticmethod
+    def _texto_proprio(no: Any, st: list[str], patterns: list[str]) -> str:
+        from .uia.nodes import _cached, _value_of
+
+        nome = (_cached(no, "CachedName", "") or "").strip()
+        if nome:
+            return nome
+        valor = _value_of(no, st, patterns)
+        # bool vem do SelectionItem: "True" no meio do texto seria ruido, nao conteudo.
+        if valor is None or isinstance(valor, bool):
+            return ""
+        return str(valor).strip()
+
+
+def get_text_impl(
+    ctx: ServerContext,
+    *,
+    window_ref: str | None,
+    root_ref: str | None,
+    max_chars: int,
+    offset: int,
+    include_refs: bool,
+) -> dict[str, Any]:
+    """Corpo sincrono de uia_get_text. Roda na thread do worker."""
+    from .budget import truncate_text
+    from .refs import ElementIdentity
+    from .uia.core import automation, control_type_name, pattern_availability_props
+    from .uia.nodes import _cached
+    from .uia.text import extrair, montar_texto
+
+    inicio = time.perf_counter()
+
+    if not window_ref and not root_ref:
+        raise ToolError(
+            Code.INVALID_ARGUMENT,
+            "Either window_ref or root_ref is required.",
+            hint="Call uia_list_windows to get a window_ref.",
+        )
+
+    entrada = ctx.refs.get(root_ref) if root_ref else None
+    if entrada is not None:
+        window_ref = entrada.window_ref
+
+    assert window_ref is not None
+    janela = resolver_janela(ctx, window_ref)
+    a = automation()
+    cr = a.build_cache_request(a.tree_props())
+
+    # Sem try/except: elemento morto tem de virar STALE_REF, e nao uma extracao vazia
+    # que o agente leria como "a janela nao tem texto".
+    raiz = (
+        entrada.element.BuildUpdatedCache(cr)
+        if entrada is not None
+        else a.element_from_handle_build_cache(janela.hwnd, cr)
+    )
+
+    versao = ctx.refs.tree_version(window_ref)
+    alvo = window_ref
+
+    def registrar(elem: Any) -> str:
+        return ctx.refs.put(
+            elem,
+            runtime_id=a.runtime_id_of(elem),
+            hwnd=janela.hwnd,
+            window_ref=alvo,
+            identity=ElementIdentity(
+                automation_id=_cached(elem, "CachedAutomationId", "") or "",
+                control_type=control_type_name(_cached(elem, "CachedControlType", 0)),
+                name=_cached(elem, "CachedName", "") or "",
+                class_name=_cached(elem, "CachedClassName", "") or "",
+            ),
+            tree_version=versao,
+        )
+
+    leitor = LeitorCOM(
+        a, cr, pattern_availability_props(), register=registrar if include_refs else None
+    )
+    resultado = extrair(raiz, leitor)
+    completo = montar_texto(resultado.blocos, include_refs=include_refs)
+    fatia, cortado, proximo = truncate_text(completo, max_chars=max_chars, offset=offset)
+
+    ctx.audit.log_call(
+        tool="uia_get_text",
+        result="ok",
+        # O texto em si nunca vai para a auditoria: e conteudo da tela do usuario, e o
+        # arquivo fica em disco por dias. So o tamanho.
+        params={"window_ref": alvo, "root_ref": root_ref, "chars": len(fatia)},
+        target={"process": janela.process, "pid": janela.pid},
+        duration_ms=(time.perf_counter() - inicio) * 1000,
+        read_only=ctx.policy.read_only,
+    )
+
+    resposta: dict[str, Any] = {
+        "ok": True,
+        "window_ref": alvo,
+        "text": fatia,
+        # Duas causas, um campo: a fatia cortou, ou o percurso parou no orcamento. As
+        # duas querem dizer "ha mais texto"; mentir em qualquer uma faz o agente
+        # concluir que leu a janela inteira.
+        "truncated": cortado or resultado.truncado,
+        "chars": len(fatia),
+        "next_offset": proximo,
+    }
+    if resultado.truncado and not cortado:
+        # Sem next_offset o agente ficaria sem saida: o corte foi na travessia, nao no
+        # texto. Dizer onde apertar e o minimo acionavel.
+        resposta["hint"] = (
+            "Traversal hit its node budget before the tree ended, so some text is "
+            "missing. Call uia_get_text with root_ref on a smaller subtree."
+        )
+    return resposta
+
+
+@mcp.tool()
+@tool_errors
+async def uia_get_text(
+    window_ref: Annotated[
+        str | None, Field(description="Window ref from uia_list_windows.")
+    ] = None,
+    root_ref: Annotated[
+        str | None, Field(description="Read only this subtree instead of the whole window.")
+    ] = None,
+    max_chars: Annotated[int, Field(ge=1, le=40000)] = 6000,
+    offset: Annotated[int, Field(ge=0, description="Continue from character N.")] = 0,
+    include_refs: Annotated[
+        bool, Field(description="Prefix each block with [ref], to map text back to elements.")
+    ] = False,
+) -> dict[str, Any]:
+    """Extract the readable text content of a window or subtree as linear text, in reading
+    order. Use this to read a document, dialog message, list contents or status bar without
+    dumping the full tree."""
+    ctx = context()
+    return await ctx.worker.run(
+        lambda: get_text_impl(
+            ctx,
+            window_ref=window_ref,
+            root_ref=root_ref,
+            max_chars=max_chars,
+            offset=offset,
+            include_refs=include_refs,
+        )
+    )

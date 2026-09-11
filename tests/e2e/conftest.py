@@ -35,6 +35,21 @@ def _janelas_do_bloco_de_notas() -> dict[int, object]:
     }
 
 
+def _minimizar(hwnd: int) -> None:
+    """Tira a janela de teste da frente de quem esta usando o PC.
+
+    Nao da para abri-la em outra area de trabalho virtual: a API publica
+    `IVirtualDesktopManager::MoveWindowToDesktop` so aceita janelas do proprio
+    processo e devolve E_ACCESSDENIED para as de terceiros. Minimizar resolve o
+    mesmo problema sem custo: medido nesta maquina, a mesma janela devolve 46 nos
+    e os mesmos 4 `offscreen` normal, minimizada e fora da tela — o UIA le do
+    provider, nao do que esta pintado.
+    """
+    import ctypes
+
+    ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+
+
 @pytest.fixture(scope="session")
 def bloco_de_notas(sta):
     """Abre um Bloco de Notas e o fecha ao fim.
@@ -61,6 +76,8 @@ def bloco_de_notas(sta):
     if janela is None:
         proc.terminate()
         pytest.skip("Bloco de Notas nao abriu a tempo")
+
+    _minimizar(janela.hwnd)
 
     yield janela
 
