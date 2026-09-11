@@ -41,7 +41,7 @@ PARAMS_AUDITAVEIS = frozenset(
     {
         "window_ref", "ref", "filter", "max_depth", "max_nodes",
         "max_children_per_node", "verbose", "cursor", "timeout_ms",
-        "only_interactive", "max_results", "state", "scope", "mode", "method",
+        "only_interactive", "max_results", "max_chars", "state", "scope", "mode", "method",
     }
 )
 
@@ -618,3 +618,163 @@ async def uia_find_elements(
             only_interactive=only_interactive, max_results=max_results,
         )
     )
+
+
+# --------------------------------------------------------------------------- 8.5
+
+
+class FonteDeValorCOM:
+    """Adaptador que traduz cada fonte da §8.5 numa consulta ao elemento vivo.
+
+    `Current*` de proposito, e nao `Cached*`: o que uia_get_value promete e o valor
+    AGORA, nao o do instante em que a arvore foi capturada. E um elemento so, fora
+    de laco — a proibicao de Current* da §5.2 e sobre travessia, onde um RPC por
+    propriedade por no multiplica por centenas.
+    """
+
+    def __init__(self, elemento: Any, max_chars: int) -> None:
+        self._e = elemento
+        self._max = max_chars
+
+    def tentar(self, nome: str) -> Any:
+        from .uia.core import automation
+
+        UIA = automation().UIA
+        try:
+            if nome == "ValuePattern":
+                p = self._e.GetCurrentPattern(UIA.UIA_ValuePatternId)
+                if not p:
+                    return None
+                return p.QueryInterface(UIA.IUIAutomationValuePattern).CurrentValue
+            if nome == "TextPattern":
+                p = self._e.GetCurrentPattern(UIA.UIA_TextPatternId)
+                if not p:
+                    return None
+                tp = p.QueryInterface(UIA.IUIAutomationTextPattern)
+                return tp.DocumentRange.GetText(self._max)
+            if nome == "RangeValuePattern":
+                p = self._e.GetCurrentPattern(UIA.UIA_RangeValuePatternId)
+                if not p:
+                    return None
+                return p.QueryInterface(UIA.IUIAutomationRangeValuePattern).CurrentValue
+            if nome == "TogglePattern":
+                p = self._e.GetCurrentPattern(UIA.UIA_TogglePatternId)
+                if not p:
+                    return None
+                return p.QueryInterface(UIA.IUIAutomationTogglePattern).CurrentToggleState
+            if nome == "SelectionPattern":
+                p = self._e.GetCurrentPattern(UIA.UIA_SelectionPatternId)
+                if not p:
+                    return None
+                sp = p.QueryInterface(UIA.IUIAutomationSelectionPattern)
+                sel = sp.GetCurrentSelection()
+                # Nada selecionado nao e "valor vazio": e ausencia de fonte, entao
+                # devolve None e a cadeia segue para LegacyIAccessible/Name.
+                nomes = [sel.GetElement(i).CurrentName for i in range(sel.Length)]
+                return ", ".join(n for n in nomes if n) or None
+            if nome == "LegacyIAccessible":
+                p = self._e.GetCurrentPattern(UIA.UIA_LegacyIAccessiblePatternId)
+                if not p:
+                    return None
+                return p.QueryInterface(UIA.IUIAutomationLegacyIAccessiblePattern).CurrentValue
+            if nome == "Name":
+                return self._e.CurrentName or None
+        except Exception:
+            # Pattern anunciado mas nao implementado acontece na pratica: segue a
+            # cadeia em vez de derrubar a leitura inteira.
+            return None
+        return None
+
+
+def _snapshot_atualizado(a: Any, elemento: Any) -> Any:
+    """Reconstroi o cache do elemento para que `st`/`pat`/`rect` sejam de agora.
+
+    Sem isto a resposta misturaria dois instantes: `value` viria vivo pelos
+    patterns e `st` viria do CacheRequest da captura da arvore — um checkbox
+    marcado depois do uia_get_tree sairia com value="on" e st=["unchecked"].
+    Custa um RPC, num elemento so.
+    """
+    try:
+        return elemento.BuildUpdatedCache(a.build_cache_request(a.tree_props()))
+    except Exception:
+        # Provider que recusa o refresh ainda tem o cache da captura: melhor um
+        # estado antigo do que nenhum.
+        return elemento
+
+
+def get_value_impl(ctx: ServerContext, *, ref: str, max_chars: int) -> dict[str, Any]:
+    """Corpo sincrono de uia_get_value. Roda na thread do worker."""
+    from .budget import truncate_name, truncate_text
+    from .uia.core import automation, control_type_name, pattern_availability_props
+    from .uia.nodes import _cached, _rect_of, states_of
+    from .uia.tree import _patterns_disponiveis
+    from .uia.values import ler_valor, tipo_de_valor
+
+    inicio = time.perf_counter()
+    entrada = ctx.refs.get(ref)
+    janela = resolver_janela(ctx, entrada.window_ref)
+    a = automation()
+    elemento = _snapshot_atualizado(a, entrada.element)
+
+    # Sem try/except: num elemento morto isto levanta UIA_E_ELEMENTNOTAVAILABLE e o
+    # worker converte para STALE_REF, que e a resposta acionavel. Engolir a excecao
+    # transformaria o campo de senha morto num elemento "sem senha" — o pior default.
+    is_password = bool(elemento.CurrentIsPassword)
+
+    valor, fonte = ler_valor(FonteDeValorCOM(elemento, max_chars), is_password=is_password)
+
+    truncado = False
+    if isinstance(valor, str) and fonte != "redacted":
+        valor, truncado, _ = truncate_text(valor, max_chars=max_chars)
+
+    patterns = _patterns_disponiveis(elemento, pattern_availability_props())
+    st = states_of(elemento, patterns)
+
+    ctx.audit.log_call(
+        tool="uia_get_value",
+        result="ok",
+        params={"ref": ref, "max_chars": max_chars},
+        target={"process": janela.process, "pid": janela.pid},
+        element={"ref": ref, "type": control_type_name(_cached(elemento, "CachedControlType", 0))},
+        # `valor` ja e o sentinela REDACTED quando is_password: a redacao acontece
+        # antes de qualquer coisa poder escrever. is_password fecha a segunda porta,
+        # que ignora log_values='full' (CA-15).
+        value=valor if isinstance(valor, str) else str(valor),
+        is_password=is_password,
+        duration_ms=(time.perf_counter() - inicio) * 1000,
+        read_only=ctx.policy.read_only,
+    )
+
+    resposta: dict[str, Any] = {
+        "ok": True,
+        "ref": ref,
+        "rebound": False,
+        "type": control_type_name(_cached(elemento, "CachedControlType", 0)),
+        "name": truncate_name(_cached(elemento, "CachedName", "") or ""),
+        "value": valor,
+        "source": fonte,
+        "value_type": tipo_de_valor(fonte),
+        "truncated": truncado,
+        "st": st,
+        "pat": patterns,
+    }
+
+    aid = _cached(elemento, "CachedAutomationId", "") or ""
+    if aid:
+        resposta["aid"] = aid
+    rect = _rect_of(elemento)
+    if rect is not None:
+        resposta["rect"] = rect
+    return resposta
+
+
+@mcp.tool()
+@tool_errors
+async def uia_get_value(
+    ref: Annotated[str, Field(description="Element ref from uia_get_tree or uia_find_elements.")],
+    max_chars: Annotated[int, Field(ge=1, le=40000)] = 6000,
+) -> dict[str, Any]:
+    """Read the current value and full state of a single element by ref: text of an edit box,
+    toggle state of a checkbox, selection of a combo box, range value of a slider."""
+    ctx = context()
+    return await ctx.worker.run(lambda: get_value_impl(ctx, ref=ref, max_chars=max_chars))
